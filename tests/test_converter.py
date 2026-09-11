@@ -156,9 +156,8 @@ class ProfileTests(unittest.TestCase):
         out = io.StringIO()
         converter.write_cachegrind(out, costs, Path("firmware.elf"))
         self.assertEqual(out.getvalue(),
-            "# cachegrind format\n"
-            "desc: Tarmac flat instruction profile; no cache simulation\n"
-            "cmd: firmware.elf\npositions: instr line\nevents: Ir\n"
+            "# callgrind format\n"
+            'positions: instr line\nevents: Ir\nob: "firmware.elf"\n'
             "fl=???\nfn=???\n0x3000 0 1\n"
             "fl=a.c\nfn=work\n0x1000 7 3\n0x1002 7 4\n"
             "fl=b.c\nfn=work\n0x2000 7 2\nsummary: 10\n")
@@ -251,7 +250,7 @@ class IntegrationTests(unittest.TestCase):
                 self.assertRegex(profile, r"fn=never_called\n0x[0-9a-f]+ 3 0\n")
                 self.assertNotIn("fn=data_only", profile)
                 self.assertTrue(profile.endswith("summary: 5\n"))
-                self.assertTrue(profile.startswith("# cachegrind format\n"))
+                self.assertTrue(profile.startswith("# callgrind format\n"))
                 self.assertIn("positions: instr line\nevents: Ir\n", profile)
                 values = json.loads(stats.read_text())
                 self.assertEqual(values["instructions"], 5)

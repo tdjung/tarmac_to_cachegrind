@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Counter as CounterType, Dict, Iterable, List, Optional, TextIO, Tuple
 
 
@@ -310,13 +311,10 @@ def one_line(value: str) -> str:
     return value.replace("\r", " ").replace("\n", " ")
 
 
-def write_cachegrind(out: TextIO, costs: CounterType[Position], elf: Path, description=None) -> None:
+def write_cachegrind(out: TextIO, costs: CounterType[Position], elf: Path) -> None:
     """Write the requested instruction-address and source-line profile format."""
-    out.write("# cachegrind format\n")
-    if description:
-        out.write("desc: " + one_line(description) + "\n")
-    out.write("desc: Tarmac flat instruction profile; no cache simulation\n")
-    out.write(f"cmd: {one_line(str(elf))}\npositions: instr line\nevents: Ir\n")
+    out.write("# callgrind format\npositions: instr line\nevents: Ir\n")
+    out.write("ob: " + json.dumps(str(elf), ensure_ascii=False) + "\n")
     previous = None
     for source in sorted(costs, key=lambda s: (s.file, s.function, s.pc, s.line)):
         key = (source.file, source.function)
@@ -353,6 +351,13 @@ def integer(value: str) -> int:
         return int(value, 0)
     except ValueError as exc:
         raise argparse.ArgumentTypeError("expected an integer, e.g. 0 or 0x20000000") from exc
+
+
+def nonnegative_integer(value):
+    number = integer(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("depth must be non-negative")
+    return number
 
 
 class ProfileContext:
@@ -404,17 +409,26 @@ class ProfileContext:
         return costs
 
 
-def discover(root, patterns, output_dir):
-    """Filename filter; do not follow directory/file symlinks or scan outputs."""
+def discover(root, patterns, output_dir, max_depth=1):
+    """Depth 0 scans root only; prune traversal before opening deeper folders."""
+    if max_depth < 0:
+        raise ConversionError("--max-depth must be non-negative")
     found = []
-    for directory, dirs, names in os.walk(str(root), followlinks=False):
-        dirs[:] = sorted(name for name in dirs
-                         if not (Path(directory) / name).is_symlink()
-                         and (Path(directory) / name).resolve() != output_dir)
-        for name in sorted(names):
-            path = Path(directory) / name
-            if path.is_file() and not path.is_symlink() and any(fnmatch.fnmatchcase(name, p) for p in patterns):
-                found.append(path)
+    pending = [(root, 0)]
+    while pending:
+        directory, depth = pending.pop()
+        with os.scandir(str(directory)) as entries:
+            for entry in entries:
+                path = directory / entry.name
+                if path == output_dir:
+                    continue
+                # Filter names before file metadata calls; never resolve each path.
+                if any(fnmatch.fnmatchcase(entry.name, p) for p in patterns):
+                    if entry.is_file(follow_symlinks=False):
+                        found.append(path)
+                        continue
+                if depth < max_depth and entry.is_dir(follow_symlinks=False):
+                    pending.append((path, depth + 1))
     return sorted(found)
 
 
@@ -441,19 +455,24 @@ def run_batch(args):
     with args.elf.open("rb") as file:
         if file.read(4) != b"\x7fELF":
             raise ConversionError("--elf must point to an ELF file")
-    paths = discover(root, args.pattern or ["tarmac*.log", "tarmac*.log.gz"], output)
+    print("Searching {} (max-depth={})...".format(root, args.max_depth), file=sys.stderr, flush=True)
+    started = time.monotonic()
+    paths = discover(root, args.pattern or ["tarmac*.log", "tarmac*.log.gz"], output, args.max_depth)
+    print("Search complete: {} logs in {:.2f}s".format(len(paths), time.monotonic() - started), file=sys.stderr, flush=True)
     if not paths:
         raise ConversionError("no matching logs found")
     names = [output_name(path, root) for path in paths]
     if len(set(names)) != len(names):
         raise ConversionError("output filename collision; narrow --pattern or rename colliding input folders/logs")
     print("Found {} logs; analyzing ELF...".format(len(paths)), file=sys.stderr, flush=True)
+    started = time.monotonic()
     context = ProfileContext(args)
+    print("ELF analysis complete in {:.2f}s".format(time.monotonic() - started), file=sys.stderr, flush=True)
     output.mkdir(parents=True, exist_ok=True)
     total = context.baseline.copy()
     report = {"elf": str(args.elf.resolve()), "root": str(root), "matched": len(paths),
               "successful": [], "failed": [], "total_instructions": 0,
-              "merged_output": None}
+              "merged_output": None, "max_depth": args.max_depth, "partial_merge": False}
     for index, (path, name) in enumerate(zip(paths, names), 1):
         try:
             opener = gzip.open if path.name.endswith(".gz") else open
@@ -480,10 +499,10 @@ def run_batch(args):
     if report["successful"]:
         name = "total_merge_cachegrind.out"
         with atomic_text(output / name) as file:
-            description = None
-            if report["failed"]:
-                description = "PARTIAL MERGE: {} of {} logs failed; see batch_report.json".format(len(report["failed"]), len(paths))
-            write_cachegrind(file, total, args.elf, description=description)
+            write_cachegrind(file, total, args.elf)
+        if report["failed"]:
+            report["partial_merge"] = True
+            print("warning: PARTIAL MERGE: {} logs failed; see batch_report.json".format(len(report["failed"])), file=sys.stderr, flush=True)
         report["merged_output"] = name
         print("complete " + json.dumps(name), file=sys.stderr, flush=True)
     with atomic_text(output / "batch_report.json") as file:
@@ -504,6 +523,7 @@ def build_parser() -> argparse.ArgumentParser:
     output.add_argument("-o", "--output", type=Path, help="output file, or empty output directory in batch mode")
     output.add_argument("--output-dir", type=Path, help="batch output directory (default: ROOT/cachegrind-output)")
     parser.add_argument("--pattern", action="append", help="batch basename glob, repeatable; default: tarmac*.log and tarmac*.log.gz")
+    parser.add_argument("--max-depth", type=nonnegative_integer, default=1, help="batch directory depth: 0=root only, 1=root and immediate children (default)")
     parser.add_argument("--merge-only", action="store_true", help="batch: write only merged profile and report")
     parser.add_argument("--format", choices=("auto", "es", "it"), default="auto", dest="input_format")
     parser.add_argument("--addr2line", help="GNU-compatible addr2line (auto-detect by default; use objdump -l if none found)")

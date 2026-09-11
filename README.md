@@ -59,7 +59,7 @@ python3 tarmac_to_cachegrind.py core1.log \
 ## 여러 시나리오 일괄 변환 및 merge
 
 배포할 파일은 **`tarmac_to_cachegrind.py` 하나**입니다. 입력이 로그 파일이면 단일
-변환, 폴더이면 재귀 배치 변환으로 자동 선택합니다. 기존 별도 배치 파일은 통합되어
+변환, 폴더이면 깊이가 제한된 배치 변환으로 자동 선택합니다. 기존 별도 배치 파일은 통합되어
 제거됐으므로 배치 실행 명령도 이 파일명으로 바꿔 주세요. 배치에서는 ELF
 디스어셈블/소스 매핑을 공유합니다. trace에서 새롭게 발견된
 PC만 추가 조회하며, 한 번에 하나의 로그만 읽습니다. 병렬 작업 프로세스를 만들지 않습니다.
@@ -71,7 +71,9 @@ python3 tarmac_to_cachegrind.py /work/test_results \
   --output-dir /work/coverage/run001
 ```
 
-- 상위 폴더 아래를 재귀 탐색합니다. 기본 파일명 패턴은 `tarmac*.log` 및
+- 기본적으로 입력 폴더와 바로 아래 하위 폴더까지만 탐색합니다(`--max-depth 1`).
+  `--max-depth 0`은 입력 폴더만, `--max-depth 2`는 두 단계 아래까지 탐색합니다.
+  깊이 제한에 도달하면 더 아래 폴더를 열지 않습니다. 기본 파일명 패턴은 `tarmac*.log` 및
   `tarmac*.log.gz`이며 대소문자를 구분합니다. 심볼릭 링크는 따라가지 않습니다.
 - 먼저 파일명으로 후보를 좁히고 실제 변환 파서로 검증합니다. 모든 `.log`의 내용을
   별도로 탐색하는 이중 읽기를 하지 않습니다. `build.log` 등은 무시하며, 후보 파일에
@@ -87,6 +89,10 @@ python3 tarmac_to_cachegrind.py /work/test_results \
 | `case01/tarmac_core0.log` | `case01_tarmac_core0_cachegrind.out` |
 | `case02/tarmac_core0.log` | `case02_tarmac_core0_cachegrind.out` |
 | `group/case03/tarmac_core0.log.gz` | `group_case03_tarmac_core0_cachegrind.out` |
+
+기본 깊이에서는 위 표의 `group/case03` 로그는 제외됩니다. 이 경로까지 포함하려면
+`--max-depth 2`를 지정하세요. 파일명 조건에 맞지 않는 파일은 파일 정보 조회를
+최소화하고, 모든 경로에 `resolve()`를 호출하지 않습니다.
 
 끝에는 **`total_merge_cachegrind.out`**과 **`batch_report.json`**도 생성됩니다.
 merge는 변환 중 메모리에서 동일한 `PC·파일·함수·라인`의 `Ir`을 합산합니다. 개별 출력
@@ -128,7 +134,8 @@ python3 tarmac_to_cachegrind.py /work/test_results \
 
 각 파일의 성공/실패 및 통계는 `batch_report.json`에 남습니다. 잘못된 로그가 있어도
 나머지를 계속 변환하며, 실패가 하나라도 있으면 종료 코드는 1입니다. 일부만 성공하면
-성공한 로그의 결과로 total을 생성하되 파일의 `desc:`에 **PARTIAL MERGE**를 표시합니다.
+성공한 로그의 결과로 total을 생성하고 stderr에 **PARTIAL MERGE** 경고를 표시하며
+JSON의 `partial_merge`를 true로 기록합니다. 출력 프로파일에는 `desc:`를 넣지 않습니다.
 모두 실패하면 total은 만들지 않습니다. ELF 분석 실패나 출력 이름 충돌 등 공통 오류는
 변환 시작 전에 중단합니다. 실행 명령어가 0개라도 EXC/IS 같은 인식 가능한 이벤트가
 있으면 기본 coverage 모드에서 0으로 처리하지만, 빈 파일이나 무관한 텍스트는 실패합니다.
@@ -139,7 +146,10 @@ python3 tarmac_to_cachegrind.py /work/test_results \
 출력을 파일로 리다이렉트해도 각 메시지를 바로 기록합니다.
 
 ```text
+Searching /work/test_results (max-depth=1)...
+Search complete: 800 logs in 0.25s
 Found 800 logs; analyzing ELF...
+ELF analysis complete in 3.10s
 [1/800] complete "case01_tarmac_core0_cachegrind.out"
 [2/800] complete "case01_tarmac_core1_cachegrind.out"
 ...
@@ -148,6 +158,9 @@ complete "total_merge_cachegrind.out"
 complete "batch_report.json"
 Completed: 800 succeeded, 0 failed; ...
 ```
+
+위 시간은 표시 형식을 설명하기 위한 예시입니다. 검색과 ELF 분석 시간을 따로 표시하므로
+두 단계 중 어느 쪽에서 지연되는지 확인할 수 있습니다.
 
 실패한 파일은 `FAILED`로 출력하고 complete로 표시하지 않습니다. `--merge-only`에서는
 개별 파일을 생성하지 않으므로 각 입력의 합산이 끝나면 `processed "입력파일"`로 표시하며,
@@ -228,11 +241,10 @@ timestamp는 정수이며 생략할 수 있습니다. 단위는 `tic`, `ps`, `ns
 ## 출력 의미
 
 ```text
-# cachegrind format
-desc: Tarmac flat instruction profile; no cache simulation
-cmd: firmware.elf
+# callgrind format
 positions: instr line
 events: Ir
+ob: "firmware.elf"
 fl=src/main.c
 fn=main
 0x202 75 0
@@ -270,7 +282,9 @@ CSV에도 미실행 PC를 `Ir=0`으로 포함합니다. JSON의 `unique_pcs`는 
 수입니다. `--load-offset`은 ELF 주소를 runtime 주소로 변환하는 단계에도 적용됩니다.
 뷰어가 0인 항목을 숨기면 표시 필터를 조정하세요. 요청된 출력은 `positions: instr line`을
 사용하므로 기존 line-only Cachegrind 형식과 다릅니다. `cg_annotate`와 같은 line-only
-reader는 지원하지 않을 수 있습니다. 첫 줄은 요청된 `# cachegrind format`을 사용합니다.
+reader는 지원하지 않을 수 있습니다. 첫 줄은 `# callgrind format`이며, `events: Ir` 다음에 요청된 `ob: "ELF 경로"`를
+기록합니다. `desc:`와 `cmd:`는 출력하지 않습니다. `ob:` 표기는 사용자 뷰어용 요청
+형식이며 일반 Callgrind의 object 지정 `ob=`와는 다릅니다.
 
 기존처럼 실행된 PC만 처리하려면 다음과 같이 실행합니다. addr2line을 사용할 수 있으면
 이 모드에는 objdump가 필요 없고 대형 ELF 전체를 탐색하지 않습니다. addr2line이 없으면
@@ -354,7 +368,7 @@ gzip -dc core0.log.gz | python3 tarmac_to_cachegrind.py - --elf core0.elf -o cac
 python3 -m unittest discover -s tests -v
 ```
 
-Python 3.6.8 및 3.12.14 인터프리터에서 아래 36개 테스트의 통과를 확인했습니다.
+Python 3.6.8 및 3.12.14 인터프리터에서 아래 38개 테스트의 통과를 확인했습니다.
 `dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,
@@ -367,6 +381,7 @@ Python 3.6.8 및 3.12.14 인터프리터에서 아래 36개 테스트의 통과�
   미실행 함수, 실행 PC 전용 모드, 미해결 PC 보존 및 명시적 도구 경로 오류.
 - 800개 합성 로그의 일괄 변환/merge 및 ELF 분석 재사용, 재귀 파일명, 패턴 필터,
   부분 실패 보고, 출력 충돌/기존 결과 보호, merge 전용 모드 및 배치 fallback.
+- 깊이 0/1/2의 탐색 결과, 제한 아래 폴더를 열지 않는지, 음수 깊이 거부를 검증합니다.
 - 헤더 순서, PC/라인/Ir 열, 미실행 PC, runtime offset, merge 비용 보존을 검증합니다.
   사용자 뷰어 자체의 로딩 검증은 포함하지 않습니다.
 

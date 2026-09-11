@@ -54,7 +54,7 @@ class BatchTests(unittest.TestCase):
         self.assertIn('[1/800] complete "case000_tarmac_a_cachegrind.out"', progress.getvalue())
         self.assertIn('[800/800] complete "case399_tarmac_b_cachegrind.out"', progress.getvalue())
         self.assertIn('complete "total_merge_cachegrind.out"', progress.getvalue())
-        completion_calls = [call for call in prints.call_args_list if "complete " in str(call[0][0])]
+        completion_calls = [call for call in prints.call_args_list if 'complete "' in str(call[0][0])]
         self.assertEqual(len(completion_calls), 802)  # 800 profiles, total, report
         self.assertTrue(all(call[1].get("flush") is True for call in completion_calls))
         # One objdump plus one addr2line batch for this small ELF, not 800 each.
@@ -62,7 +62,7 @@ class BatchTests(unittest.TestCase):
         output = root / "cachegrind-output"
         self.assertEqual(len(list(output.glob("*_cachegrind.out"))), 801)
         merged = (output / "total_merge_cachegrind.out").read_text()
-        self.assertTrue(merged.startswith("# cachegrind format\n"))
+        self.assertTrue(merged.startswith("# callgrind format\n"))
         self.assertIn("positions: instr line\nevents: Ir\n", merged)
         self.assertIn("0x{:x} 1 800\n".format(self.pcs["work"]), merged)
         self.assertRegex(merged, r"fn=work\n0x[0-9a-f]+ 1 800\n")
@@ -79,14 +79,15 @@ class BatchTests(unittest.TestCase):
         (root / "build.log").write_text("unrelated")
         (root / "tarmac_noise.log").write_text("unrelated")
         with patch("sys.stderr", io.StringIO()):
-            self.assertEqual(batch.main(self.args(root)), 1)
+            self.assertEqual(batch.main(self.args(root, "--max-depth", "2")), 1)
         output = root / "cachegrind-output"
         report = json.loads((output / "batch_report.json").read_text())
         self.assertEqual(report["matched"], 2)
         self.assertEqual(len(report["failed"]), 1)
         self.assertTrue((output / "nested_deep_tarmac_good_cachegrind.out").exists())
-        self.assertIn("PARTIAL MERGE", (output / "total_merge_cachegrind.out").read_text())
-        self.assertTrue((output / "total_merge_cachegrind.out").read_text().startswith("# cachegrind format\n"))
+        self.assertTrue(report["partial_merge"])
+        self.assertNotIn("desc:", (output / "total_merge_cachegrind.out").read_text())
+        self.assertTrue((output / "total_merge_cachegrind.out").read_text().startswith("# callgrind format\n"))
 
     def test_pattern_merge_only_and_existing_output_protection(self):
         root = self.fixture("pattern")
@@ -105,9 +106,33 @@ class BatchTests(unittest.TestCase):
         self.log(root / "a_b" / "tarmac_x.log")
         self.log(root / "a" / "b" / "tarmac_x.log")
         with patch("sys.stderr", io.StringIO()) as err:
-            self.assertEqual(batch.main(self.args(root)), 1)
+            self.assertEqual(batch.main(self.args(root, "--max-depth", "2")), 1)
         self.assertIn("collision", err.getvalue())
         self.assertFalse((root / "cachegrind-output").exists())
+
+    def test_depth_limit_prunes_before_opening_deeper_directories(self):
+        root = self.fixture("depth")
+        self.log(root / "tarmac_root.log")
+        self.log(root / "a" / "tarmac_child.log")
+        self.log(root / "a" / "b" / "tarmac_deep.log")
+        output = root / "out"
+        output.mkdir()
+        self.log(output / "tarmac_generated.log")
+        for depth, expected in ((0, 1), (1, 2), (2, 3)):
+            with self.subTest(depth=depth), patch.object(os, "scandir", wraps=os.scandir) as scan:
+                found = batch.discover(root, ["tarmac*.log"], output, depth)
+                self.assertEqual(len(found), expected)
+                opened = {Path(call[0][0]) for call in scan.call_args_list}
+                self.assertNotIn(output, opened)
+                if depth < 2:
+                    self.assertNotIn(root / "a" / "b", opened)
+                if depth == 0:
+                    self.assertEqual(opened, {root})
+        self.assertEqual(len(batch.discover(root, ["tarmac*.log"], output)), 2)
+
+    def test_negative_depth_is_rejected(self):
+        with patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            batch.build_parser().parse_args(["logs", "--elf", "firmware.elf", "--max-depth", "-1"])
 
     def test_real_cli_fallback(self):
         root = self.fixture("fallback")
