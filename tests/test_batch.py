@@ -1,0 +1,117 @@
+import io
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import unittest
+from unittest.mock import patch
+
+import tarmac_batch_to_cachegrind as batch
+import test_converter as single_tests
+
+ROOT = single_tests.ROOT
+
+
+@unittest.skipUnless(all(shutil.which(t) for t in ("gcc", "nm", "addr2line", "objdump")),
+                     "batch integration requires gcc and binutils")
+class BatchTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        single_tests.IntegrationTests.setUpClass.__func__(cls)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def fixture(self, name):
+        root = self.directory / name
+        root.mkdir()
+        return root
+
+    def log(self, path, dialect="es"):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pc = self.pcs["work"]
+        if dialect == "es":
+            text = "1 tic ES ({:08x}:2000) T thrd: MOVS r0,#0".format(pc)
+        else:
+            text = "1 ps IT ({:08x}:00000000) {:08x} 2000 T16 MOVS r0,#0".format(pc, pc)
+        path.write_text(text)
+
+    def args(self, root, *extra):
+        return [str(root), "--elf", str(self.elf), "--addr2line", shutil.which("addr2line"),
+                "--objdump", shutil.which("objdump")] + list(extra)
+
+    def test_800_logs_share_elf_analysis_and_merge_counts(self):
+        root = self.fixture("large")
+        for index in range(400):
+            folder = root / "case{:03d}".format(index)
+            self.log(folder / "tarmac_a.log")
+            self.log(folder / "tarmac_b.log", "it")
+        with patch.object(subprocess, "run", wraps=subprocess.run) as calls, patch("sys.stderr", io.StringIO()):
+            self.assertEqual(batch.main(self.args(root)), 0)
+        # One objdump plus one addr2line batch for this small ELF, not 800 each.
+        self.assertEqual(calls.call_count, 2)
+        output = root / "cachegrind-output"
+        self.assertEqual(len(list(output.glob("*_cachegrind.out"))), 801)
+        merged = (output / "total_merge_cachegrind.out").read_text()
+        self.assertIn("fn=work\n1 800\n", merged)
+        self.assertIn("fn=never_called\n3 0\n", merged)
+        self.assertTrue(merged.endswith("summary: 800\n"))
+        report = json.loads((output / "batch_report.json").read_text())
+        self.assertEqual(len(report["successful"]), 800)
+        self.assertEqual(report["failed"], [])
+        self.assertTrue((output / "case000_tarmac_a_cachegrind.out").exists())
+
+    def test_non_tarmac_ignored_and_failed_candidate_reported(self):
+        root = self.fixture("partial")
+        self.log(root / "nested" / "deep" / "tarmac_good.log")
+        (root / "build.log").write_text("unrelated")
+        (root / "tarmac_noise.log").write_text("unrelated")
+        with patch("sys.stderr", io.StringIO()):
+            self.assertEqual(batch.main(self.args(root)), 1)
+        output = root / "cachegrind-output"
+        report = json.loads((output / "batch_report.json").read_text())
+        self.assertEqual(report["matched"], 2)
+        self.assertEqual(len(report["failed"]), 1)
+        self.assertTrue((output / "nested_deep_tarmac_good_cachegrind.out").exists())
+        self.assertIn("PARTIAL MERGE", (output / "total_merge_cachegrind.out").read_text())
+
+    def test_pattern_merge_only_and_existing_output_protection(self):
+        root = self.fixture("pattern")
+        self.log(root / "case" / "tarmac_core0.log")
+        self.log(root / "case" / "tarmac_core1.log")
+        args = self.args(root, "--pattern", "tarmac_core0*.log", "--merge-only")
+        with patch("sys.stderr", io.StringIO()):
+            self.assertEqual(batch.main(args), 0)
+            self.assertEqual(batch.main(args), 1)
+        output = root / "cachegrind-output"
+        self.assertEqual({p.name for p in output.iterdir()}, {"batch_report.json", "total_merge_cachegrind.out"})
+        self.assertTrue((output / "total_merge_cachegrind.out").read_text().endswith("summary: 1\n"))
+
+    def test_colliding_flat_names_rejected(self):
+        root = self.fixture("collision")
+        self.log(root / "a_b" / "tarmac_x.log")
+        self.log(root / "a" / "b" / "tarmac_x.log")
+        with patch("sys.stderr", io.StringIO()) as err:
+            self.assertEqual(batch.main(self.args(root)), 1)
+        self.assertIn("collision", err.getvalue())
+        self.assertFalse((root / "cachegrind-output").exists())
+
+    def test_real_cli_fallback(self):
+        root = self.fixture("fallback")
+        self.log(root / "tarmac_one.log")
+        result = subprocess.run([
+            sys.executable, str(ROOT / "tarmac_batch_to_cachegrind.py"), str(root),
+            "--elf", str(self.elf), "--objdump", shutil.which("objdump"),
+        ], env=dict(os.environ, PATH=str(root / "missing-tools")),
+            universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("using objdump -l", result.stderr)
+        merged = (root / "cachegrind-output" / "total_merge_cachegrind.out").read_text()
+        self.assertIn("fn=work\n1 1\n", merged)
+
+
+if __name__ == "__main__":
+    unittest.main()

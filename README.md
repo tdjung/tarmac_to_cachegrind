@@ -57,6 +57,82 @@ cg_annotate --show=Ir --sort=Ir cachegrind.out.core1
 현재 지원하지 않습니다. 코어별 flat 실행 횟수를 만들 때는 `tic`/`ps` 시간축 정렬이
 필요하지 않습니다.
 
+## 여러 시나리오 일괄 변환 및 merge
+
+Linux에서 수백 개 로그를 처리할 때는 **별도의 Python 배치 진입점**을 사용합니다.
+Bash에서 변환기를 로그마다 실행하면 같은 ELF를 반복 분석하게 됩니다. 아래 스크립트는
+기존 파서를 import하고 ELF 디스어셈블/소스 매핑을 공유합니다. trace에서 새롭게 발견된
+PC만 추가 조회하며, 한 번에 하나의 로그만 읽습니다. 병렬 작업 프로세스를 만들지 않습니다.
+
+```bash
+python3 tarmac_batch_to_cachegrind.py /work/test_results \
+  --elf /work/fw/core0.elf \
+  --objdump arm-none-eabi-objdump \
+  --output-dir /work/coverage/run001
+```
+
+- 상위 폴더 아래를 재귀 탐색합니다. 기본 파일명 패턴은 `tarmac*.log` 및
+  `tarmac*.log.gz`이며 대소문자를 구분합니다. 심볼릭 링크는 따라가지 않습니다.
+- 먼저 파일명으로 후보를 좁히고 실제 변환 파서로 검증합니다. 모든 `.log`의 내용을
+  별도로 탐색하는 이중 읽기를 하지 않습니다. `build.log` 등은 무시하며, 후보 파일에
+  Tarmac 명령어/예외 이벤트가 없거나 명령어 형식이 잘못됐으면 실패 목록에 기록합니다.
+- 기본 출력 폴더는 `상위폴더/cachegrind-output`입니다. 매 실행마다 **비어 있는 출력
+  폴더**를 지정하세요. 이전 실행 결과와 섞거나 덮어쓰지 않습니다.
+- 상대 폴더 경로를 `_`로 연결하고 `.log`/`.log.gz`를 제거해 이름을 만듭니다.
+  루트 바로 아래의 로그는 상위 폴더 자체의 이름을 붙입니다. 충돌하는 이름이 생기면
+  변환 전에 오류로 알리므로 폴더명이나 `--pattern`을 조정하세요.
+
+| 입력(상위폴더 기준) | 출력 파일명 |
+|---|---|
+| `case01/tarmac_core0.log` | `case01_tarmac_core0_cachegrind.out` |
+| `case02/tarmac_core0.log` | `case02_tarmac_core0_cachegrind.out` |
+| `group/case03/tarmac_core0.log.gz` | `group_case03_tarmac_core0_cachegrind.out` |
+
+끝에는 **`total_merge_cachegrind.out`**과 **`batch_report.json`**도 생성됩니다.
+merge는 변환 중 메모리에서 동일한 `파일·함수·라인`의 `Ir`을 합산합니다. 개별 출력
+파일 800개를 다시 읽는 post-merge 단계가 없습니다. 미실행 라인의 0은 유지되며,
+어느 시나리오에서든 실행한 라인은 합계가 양수가 됩니다. `Ir`은 실행 횟수의 합계이지
+그 라인을 실행한 시나리오의 개수가 아닙니다.
+
+개별 파일이 필요 없고 최종 merge만 보고 싶다면 `--merge-only`를 추가하세요.
+개별 프로파일 쓰기를 생략해 디스크 작업을 줄입니다.
+
+```bash
+python3 tarmac_batch_to_cachegrind.py /work/test_results \
+  --elf /work/fw/core0.elf --pattern 'tarmac_core0*.log' \
+  --merge-only -o /work/coverage/core0-merged
+```
+
+`--pattern`은 파일 basename에 적용하며 여러 번 지정할 수 있습니다. 지정하면 기본
+패턴을 대체합니다. 셸에서 먼저 확장되지 않도록 **따옴표로 감싸세요.** `.log.gz`도
+선택하려면 해당 패턴을 추가하세요. `--addr2line`, `--objdump`, `--load-offset`,
+`--format`, `--executed-only`도 단일 변환기와 같은 방식으로 사용할 수 있습니다.
+addr2line이 자동 탐색되지 않으면 objdump의 라인 정보를 재사용합니다.
+
+### 코어별 ELF가 다를 때
+
+**한 배치 실행은 동일한 ELF와 주소 매핑을 사용하는 로그만 선택해야 합니다.**
+두 문법 모두 파싱 가능하다는 것이 두 ELF의 주소 공간을 구분한다는 뜻은 아닙니다.
+파일명만으로 ELF가 일치하는지는 검증할 수 없습니다. 각 폴더의 두 로그가 서로 다른
+코어/ELF를 사용한다면 패턴과 출력 폴더를 분리해서 두 번 실행하세요.
+
+```bash
+python3 tarmac_batch_to_cachegrind.py /work/test_results \
+  --elf core0.elf --pattern 'tarmac_core0*.log' -o /work/coverage/core0
+
+python3 tarmac_batch_to_cachegrind.py /work/test_results \
+  --elf core1.elf --pattern 'tarmac_core1*.log' -o /work/coverage/core1
+```
+
+### 실패 처리
+
+각 파일의 성공/실패 및 통계는 `batch_report.json`에 남습니다. 잘못된 로그가 있어도
+나머지를 계속 변환하며, 실패가 하나라도 있으면 종료 코드는 1입니다. 일부만 성공하면
+성공한 로그의 결과로 total을 생성하되 파일의 `desc:`에 **PARTIAL MERGE**를 표시합니다.
+모두 실패하면 total은 만들지 않습니다. ELF 분석 실패나 출력 이름 충돌 등 공통 오류는
+변환 시작 전에 중단합니다. 실행 명령어가 0개라도 EXC/IS 같은 인식 가능한 이벤트가
+있으면 기본 coverage 모드에서 0으로 처리하지만, 빈 파일이나 무관한 텍스트는 실패합니다.
+
 ## 지원하는 로그
 
 ### ES / Tarmac Text Rev 3t
@@ -249,7 +325,7 @@ gzip -dc core0.log.gz | python3 tarmac_to_cachegrind.py - --elf core0.elf -o cac
 python3 -m unittest discover -s tests -v
 ```
 
-Python 3.6.8 및 3.12.14 인터프리터에서 아래 30개 테스트의 통과를 확인했습니다.
+Python 3.6.8 및 3.12.14 인터프리터에서 아래 35개 테스트의 통과를 확인했습니다.
 `dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,
@@ -260,6 +336,8 @@ Python 3.6.8 및 3.12.14 인터프리터에서 아래 30개 테스트의 통과�
   실행 PC 전용 모드 및 잘못된 objdump 지정 시 기존 출력 보존.
 - addr2line 없는 PATH에서 실제 objdump fallback: 두 trace 형식, offset, CSV,
   미실행 함수, 실행 PC 전용 모드, 미해결 PC 보존 및 명시적 도구 경로 오류.
+- 800개 합성 로그의 일괄 변환/merge 및 ELF 분석 재사용, 재귀 파일명, 패턴 필터,
+  부분 실패 보고, 출력 충돌/기존 결과 보호, merge 전용 모드 및 배치 fallback.
 - `cg_annotate`가 설치되어 있으면 생성한 프로파일을 실제 reader로 검증합니다.
   전체 검증을 위해 GCC/binutils/Valgrind를 설치한 환경에서 테스트를 실행하세요.
 
