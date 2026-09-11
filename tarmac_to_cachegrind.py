@@ -58,6 +58,7 @@ class Stats:
         self.unknown_function_instructions = 0
         self.unknown_source_instructions = 0
         self.events = {}  # type: Dict[str, int]
+        self.elf_instruction_pcs = 0
 
 
 class Source(namedtuple("SourceBase", "file function line")):
@@ -70,7 +71,8 @@ class Source(namedtuple("SourceBase", "file function line")):
 
 
 def count_pcs(
-    lines: Iterable[str], *, input_format: str = "auto", skip_malformed: bool = False
+    lines: Iterable[str], *, input_format: str = "auto", skip_malformed: bool = False,
+    allow_empty: bool = False
 ) -> Tuple[CounterType[int], Stats]:
     """Stream the trace; retain only a histogram of unique instruction PCs.
 
@@ -119,7 +121,7 @@ def count_pcs(
         counts[pc] += 1
         stats.instructions += 1
     stats.unique_pcs = len(counts)
-    if not counts:
+    if not counts and not allow_empty:
         raise ConversionError(
             "no executed instructions found; expected ES (pc:opcode) state ... "
             "or IT [metadata] pc opcode state ..."
@@ -193,6 +195,60 @@ def resolve_pcs(
     return sources
 
 
+def find_objdump(explicit: Optional[str], addr2line: str) -> str:
+    # Prefer the same toolchain as the selected symbolizer.
+    sibling = re.sub(r"addr2line(?=(?:\.exe)?$)", "objdump", addr2line)
+    candidates = [explicit] if explicit else [
+        sibling, "arm-none-eabi-objdump", "llvm-objdump", "objdump"
+    ]
+    for candidate in candidates:
+        if candidate == addr2line:
+            continue
+        found = shutil.which(candidate)
+        if found:
+            return found
+    raise ConversionError("objdump not found; pass --objdump /path/to/arm-none-eabi-objdump")
+
+
+def instruction_pcs(disassembly: str):
+    """Read instruction starts, excluding ARM mapping-symbol data directives."""
+    pcs = set()
+    for line in disassembly.splitlines():
+        match = re.match(r"^\s*([0-9a-fA-F]+):\s+(\S+)", line)
+        if not match:
+            continue
+        mnemonic = match.group(2)
+        if mnemonic.startswith(".") or mnemonic in ("(bad)", "<unknown>"):
+            continue
+        pcs.add(int(match.group(1), 16))
+    return pcs
+
+
+def seed_elf_pcs(counts: CounterType[int], elf: Path, tool: str,
+                 load_offset: int = 0) -> int:
+    """Seed executable instruction starts with zero; keep observed counts intact."""
+    try:
+        result = subprocess.run(
+            [tool, "-d", "-z", "--no-show-raw-insn", str(elf.resolve())],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, encoding="utf-8", errors="replace",
+            env=dict(os.environ, LC_ALL="C"), timeout=120, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ConversionError(f"cannot run objdump: {exc}") from exc
+    if result.returncode:
+        raise ConversionError(f"objdump failed (check the target toolchain): {result.stderr.strip()}")
+    pcs = instruction_pcs(result.stdout)
+    if not pcs:
+        raise ConversionError("objdump found no executable instructions in the ELF")
+    for pc in pcs:
+        runtime_pc = pc + load_offset
+        if runtime_pc < 0:
+            raise ConversionError("--load-offset produces a negative runtime address")
+        counts.setdefault(runtime_pc, 0)
+    return len(pcs)
+
+
 def aggregate(counts: CounterType[int], sources: Dict[int, Source], stats: Stats) -> CounterType[Source]:
     costs: CounterType[Source] = Counter()
     for pc, count in counts.items():
@@ -258,6 +314,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-o", "--output", required=True, type=Path, help="output cachegrind.out file")
     parser.add_argument("--format", choices=("auto", "es", "it"), default="auto", dest="input_format")
     parser.add_argument("--addr2line", help="GNU-compatible addr2line executable (auto-detected by default)")
+    parser.add_argument("--objdump", help="target-compatible objdump for ELF instruction enumeration")
+    parser.add_argument("--executed-only", action="store_true", help="omit unexecuted ELF locations (legacy behavior; no objdump needed)")
     parser.add_argument("--load-offset", type=integer, default=0, help="runtime PC minus ELF address (decimal/hex)")
     parser.add_argument("--skip-malformed", action="store_true", help="omit unsupported instruction records and warn (default: fail)")
     parser.add_argument("--pc-counts", type=Path, help="optional CSV audit: PC, ELF address, Ir, source")
@@ -294,13 +352,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         validate_paths(args)
         tool = find_addr2line(args.addr2line)
-        options = dict(input_format=args.input_format, skip_malformed=args.skip_malformed)
+        options = dict(input_format=args.input_format, skip_malformed=args.skip_malformed,
+                       allow_empty=not args.executed_only)
         if args.trace == "-":
             counts, stats = count_pcs(sys.stdin, **options)
         else:
             opener = gzip.open if args.trace.lower().endswith(".gz") else open
             with opener(args.trace, "rt", encoding="utf-8-sig", errors="strict") as trace:
                 counts, stats = count_pcs(trace, **options)
+        if not args.executed_only:
+            stats.elf_instruction_pcs = seed_elf_pcs(
+                counts, args.elf, find_objdump(args.objdump, tool), args.load_offset
+            )
         sources = resolve_pcs(counts, args.elf, tool, load_offset=args.load_offset)
         costs = aggregate(counts, sources, stats)
         if args.pc_counts:
@@ -318,6 +381,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         with atomic_text(args.output) as out:
             write_cachegrind(out, costs, args.elf)
         print(f"{stats.instructions:,} instructions, {stats.unique_pcs:,} unique PCs -> {args.output}", file=sys.stderr)
+        if not stats.instructions:
+            print("warning: no executed instructions found; output contains only zero-cost ELF locations", file=sys.stderr)
         if stats.malformed:
             print(f"warning: omitted {stats.malformed} malformed instruction records", file=sys.stderr)
         if stats.unknown_source_instructions or stats.unknown_function_instructions:

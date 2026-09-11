@@ -90,6 +90,23 @@ class ParserTests(unittest.TestCase):
 
 
 class ProfileTests(unittest.TestCase):
+    def test_instruction_boundaries_exclude_arm_literal_pool(self):
+        self.assertEqual(converter.instruction_pcs(
+            "Disassembly of section .text:\n"
+            "00001000 <work>:\n"
+            " 1000: movw r0, #0\n"
+            " 1004: bx lr\n"
+            " 1006: .short 0x0000\n"
+            " 1008: .word 0x12345678\n"
+            " 100c: <unknown>\n"
+        ), {0x1000, 0x1004})
+
+    def test_zero_pcs_on_same_line_do_not_replace_execution_cost(self):
+        source = converter.Source("a.c", "work", 7)
+        costs = converter.aggregate(Counter({0x1000: 3, 0x1002: 0}),
+                                    {0x1000: source, 0x1002: source}, converter.Stats())
+        self.assertEqual(costs[source], 3)
+
     def test_costs_aggregate_by_file_function_line_and_preserve_unknowns(self):
         counts = Counter({0x1000: 3, 0x1002: 4, 0x2000: 2, 0x3000: 1})
         sources = {
@@ -140,8 +157,8 @@ class ProfileTests(unittest.TestCase):
             converter.resolve_pcs([0x1000], Path("a.elf"), "addr2line", load_offset=0x2000)
 
 
-@unittest.skipUnless(all(shutil.which(tool) for tool in ("gcc", "addr2line", "nm")),
-                     "real ELF integration requires gcc, addr2line and nm")
+@unittest.skipUnless(all(shutil.which(tool) for tool in ("gcc", "addr2line", "nm", "objdump")),
+                     "real ELF integration requires gcc, addr2line, nm and objdump")
 class IntegrationTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -152,6 +169,8 @@ class IntegrationTests(unittest.TestCase):
         cls.source.write_text(
             "int work(int x) { return x + 1; }\n"
             "int main(void) { return work(3); }\n"
+            "int never_called(void) { return 99; }\n"
+            "int data_only = 123;\n"
         )
         subprocess.run(["gcc", "-g", "-O0", "-fno-inline", "-no-pie", str(cls.source), "-o", str(cls.elf)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         nm = subprocess.run(["nm", "-n", str(cls.elf)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
@@ -195,13 +214,18 @@ class IntegrationTests(unittest.TestCase):
                 profiles.append(profile)
                 self.assertIn("fn=work\n1 3\n", profile)
                 self.assertIn("fn=main\n2 2\n", profile)
+                self.assertIn("fn=never_called\n3 0\n", profile)
+                self.assertNotIn("fn=data_only", profile)
                 self.assertTrue(profile.endswith("summary: 5\n"))
                 values = json.loads(stats.read_text())
                 self.assertEqual(values["instructions"], 5)
+                self.assertEqual(values["unique_pcs"], 2)
+                self.assertGreater(values["elf_instruction_pcs"], 2)
                 self.assertEqual(values["unknown_source_instructions"], 0)
                 with audit.open() as file:
                     rows = list(csv.DictReader(file))
                 self.assertEqual(sum(int(row["Ir"]) for row in rows), 5)
+                self.assertTrue(any(row["function"] == "never_called" and row["Ir"] == "0" for row in rows))
                 if shutil.which("cg_annotate"):
                     annotated = subprocess.run(["cg_annotate", "--show=Ir", "--sort=Ir", str(output)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
                     self.assertEqual(annotated.returncode, 0, annotated.stderr)
@@ -219,17 +243,41 @@ class IntegrationTests(unittest.TestCase):
                 result = self.run_cli(name, output, "--load-offset", hex(offset), stdin=stdin)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("fn=work\n1 3\n", output.read_text())
+                self.assertIn("fn=never_called\n3 0\n", output.read_text())
 
     def test_unknown_pc_preserves_count_and_warns(self):
         output = self.directory / "unknown.out"
         result = self.run_cli("-", output, stdin="IT 00000000 2000 T16 MOVS r0,#0")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("fl=???\nfn=???\n0 1\nsummary: 1", output.read_text())
+        self.assertIn("fl=???\nfn=???\n0 1\n", output.read_text())
+        self.assertTrue(output.read_text().endswith("summary: 1\n"))
         self.assertIn("warning:", result.stderr)
 
     def test_multiple_addr2line_batches(self):
         sources = converter.resolve_pcs(self.pcs.values(), self.elf, shutil.which("addr2line"), batch_size=1)
         self.assertEqual({s.function for s in sources.values()}, {"main", "work"})
+
+    def test_empty_trace_produces_zero_coverage(self):
+        output = self.directory / "empty.out"
+        result = self.run_cli("-", output, stdin="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("fn=never_called\n3 0\n", output.read_text())
+        self.assertTrue(output.read_text().endswith("summary: 0\n"))
+        self.assertIn("no executed instructions", result.stderr)
+
+    def test_executed_only_does_not_require_objdump(self):
+        output = self.directory / "executed.out"
+        result = self.run_cli("-", output, "--executed-only", "--objdump", "/missing/objdump", stdin=self.trace("es"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("never_called", output.read_text())
+        self.assertIn("fn=work\n1 3\n", output.read_text())
+
+    def test_wrong_objdump_does_not_replace_output(self):
+        output = self.directory / "bad-objdump.out"
+        output.write_text("original")
+        result = self.run_cli("-", output, "--objdump", "/missing/objdump", stdin=self.trace("it"))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(output.read_text(), "original")
 
     def test_malformed_input_does_not_replace_output(self):
         output = self.directory / "preserved.out"

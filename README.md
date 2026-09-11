@@ -3,8 +3,9 @@
 두 가지 Arm Tarmac 로그 형식의 **PC별 명령어 실행 횟수**를 ELF와 결합해
 함수·파일·소스 라인별 **flat Cachegrind 프로파일**로 변환합니다.
 
-Python 표준 라이브러리와 GNU 호환 `addr2line`만 사용합니다.
-로그는 한 줄씩 읽고, 고유 PC별 횟수를 모은 후 `addr2line`에 일괄 질의합니다.
+Python 표준 라이브러리와 GNU 호환 `addr2line`, 대상 코어용 `objdump`를 사용합니다.
+기본적으로 ELF의 명령어 주소를 `Ir=0`으로 포함하고 trace 실행 횟수를 더합니다.
+로그는 한 줄씩 읽고, ELF/trace의 고유 PC별 횟수를 모은 후 `addr2line`에 일괄 질의합니다.
 전체 로그를 메모리에 올리거나 명령어 실행마다 외부 프로세스를 만들지 않습니다.
 
 출력 이벤트는 `Ir` 하나입니다. **call graph, 호출 횟수, inclusive cost,
@@ -17,6 +18,9 @@ Python 표준 라이브러리와 GNU 호환 `addr2line`만 사용합니다.
 - 해당 ELF를 읽을 수 있는 `addr2line`:
   `arm-none-eabi-addr2line`, `llvm-addr2line`, `addr2line` 순으로 자동 탐색합니다.
   여러 toolchain이 있으면 `--addr2line`으로 직접 지정하세요.
+- 해당 ELF를 디스어셈블할 수 있는 `objdump`. 선택된 `addr2line`과 같은 toolchain을
+  우선 탐색하며, `--objdump arm-none-eabi-objdump`처럼 직접 지정할 수 있습니다.
+  호스트용 `objdump`가 Arm을 지원하지 않으면 Arm toolchain을 지정하세요.
 - 실행 이미지에 대응하는 ELF. 함수명에는 심볼, 파일/라인에는 DWARF 디버그 정보가
   필요합니다. 실제 사용한 최적화 옵션을 유지하고 `-g`를 포함한 ELF를 사용하세요.
 - 결과 확인용 `cg_annotate`(Valgrind에 포함) 또는 KCachegrind/QCachegrind.
@@ -27,11 +31,13 @@ Python 표준 라이브러리와 GNU 호환 `addr2line`만 사용합니다.
 python3 tarmac_to_cachegrind.py core0.log \
   --elf core0.elf \
   --addr2line arm-none-eabi-addr2line \
+  --objdump arm-none-eabi-objdump \
   -o cachegrind.out.core0
 
 python3 tarmac_to_cachegrind.py core1.log \
   --elf core1.elf \
   --addr2line arm-none-eabi-addr2line \
+  --objdump arm-none-eabi-objdump \
   -o cachegrind.out.core1
 
 cg_annotate --show=Ir --sort=Ir cachegrind.out.core0
@@ -104,7 +110,8 @@ timestamp는 정수이며 생략할 수 있습니다. 단위는 `tic`, `ps`, `ns
 
 `--skip-malformed`를 명시하면 해석 불가 명령어 줄을 생략하고 경고합니다.
 기본 동작은 잘못된 형식으로 인한 누락을 숨기지 않도록 실패시키는 것입니다.
-명령어 이벤트 외의 줄은 무시합니다. 실행 명령어가 하나도 없으면 실패합니다.
+명령어 이벤트 외의 줄은 무시합니다. 실행 명령어가 하나도 없으면 기본 모드에서는
+경고와 함께 ELF 기준의 전부 0인 프로파일을 생성합니다. `--executed-only`에서는 실패합니다.
 같은 timestamp/PC가 반복돼도 각각 집계하며 임의로 중복 제거하지 않습니다.
 
 **ES 주의사항:** Arm 문서에 따르면 일부 ES 생성기는 조건 실패 때 `CCFAIL`을
@@ -123,6 +130,7 @@ fl=src/main.c
 fn=main
 42 300
 43 100
+44 0
 summary: 400
 ```
 
@@ -130,6 +138,38 @@ summary: 400
 뜻입니다. **소스 라인 자체가 300번 실행됐다는 뜻은 아닙니다.** 함수의 비용도
 그 함수에 직접 귀속된 명령어 수의 합계이며, 하위 함수의 비용을 더하지 않습니다.
 16비트와 32비트 명령어 모두 실행당 1입니다. 명령어 바이트 수나 cycle 수가 아닙니다.
+
+### 미실행 코드와 coverage
+
+기본 동작은 `objdump -d -z --no-show-raw-insn`으로 ELF의 실행 가능한 섹션에서
+명령어 시작 주소를 수집하는 것입니다. 각 주소에 0을 설정하고 trace의 횟수를
+합산하므로, 한 번도 호출되지 않은 함수나 실행되지 않은 라인도 `44 0`처럼 출력됩니다.
+같은 라인의 다른 PC가 실행됐다면 해당 라인의 값은 양수가 됩니다. `summary`에는
+실행된 횟수만 합산되므로 0인 항목이 늘어도 총 실행 수는 변하지 않습니다.
+
+메모리의 모든 바이트 주소를 PC로 취급하지 않습니다. 비실행 데이터 섹션은 제외하며,
+코드 안에서도 objdump가 `.word`/`.short` 등으로 표시하는 데이터와 해석 불가 항목은
+제외합니다. Arm/Thumb 구분과 코드 내 literal pool 식별을 위해 해당 아키텍처를
+지원하는 objdump 및 mapping symbol이 보존된 ELF를 사용하는 것이 좋습니다.
+
+**coverage의 범위는 ELF에 남아 있고 소스 라인으로 매핑 가능한 명령어입니다.**
+최적화/링커에 의해 제거된 코드, 주석, 빈 줄은 0인 실행 가능 라인으로 추가하지 않습니다.
+한 소스 라인에 여러 명령어나 분기가 있으면 일부만 실행돼도 `Ir > 0`이므로,
+이 값은 완전한 branch/condition coverage를 나타내지 않습니다.
+
+CSV에도 미실행 PC를 `Ir=0`으로 포함합니다. JSON의 `unique_pcs`는 trace에서 실제로
+실행된 고유 PC 수이고, `elf_instruction_pcs`는 objdump에서 수집한 고유 명령어 주소
+수입니다. `--load-offset`은 ELF 주소를 runtime 주소로 변환하는 단계에도 적용됩니다.
+뷰어가 0인 항목을 숨기면 표시 필터를 조정하세요. `cg_annotate`에서는
+`--threshold=0 --show=Ir --sort=Ir`로 확인할 수 있습니다.
+
+기존처럼 실행된 PC만 처리하려면 다음과 같이 실행합니다. 이 모드에는 objdump가
+필요 없고 대형 ELF 전체를 탐색하지 않습니다.
+
+```bash
+python3 tarmac_to_cachegrind.py core0.log --elf core0.elf \
+  --executed-only -o cachegrind.out.core0
+```
 
 미해결 파일/함수는 `???`, 미해결 라인은 `0`으로 기록해 비용을 보존합니다.
 디버그 정보가 없는 ELF라도 함수 심볼이 있으면 함수별 집계가 가능할 수 있습니다.
@@ -183,17 +223,19 @@ gzip -dc core0.log.gz | python3 tarmac_to_cachegrind.py - --elf core0.elf -o cac
 python3 -m unittest discover -s tests -v
 ```
 
-Python 3.6.8 및 3.12.14 인터프리터에서 아래 20개 테스트의 통과를 확인했습니다.
+Python 3.6.8 및 3.12.14 인터프리터에서 아래 25개 테스트의 통과를 확인했습니다.
 `dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,
   조건 실패, folded 명령어, malformed 입력 처리.
 - 실제 GCC 생성 ELF + `addr2line`: 함수/라인 연결, 두 문법의 출력 일치,
   offset, gzip/stdin, 미해결 주소 및 비용 보존.
+- 미실행 함수의 0 비용, 데이터 제외, 같은 라인의 0/양수 비용 합산, 빈 trace,
+  실행 PC 전용 모드 및 잘못된 objdump 지정 시 기존 출력 보존.
 - `cg_annotate`가 설치되어 있으면 생성한 프로파일을 실제 reader로 검증합니다.
   전체 검증을 위해 GCC/binutils/Valgrind를 설치한 환경에서 테스트를 실행하세요.
 
-ELF 통합 테스트에는 `gcc`, `nm`, `addr2line`이 필요하며 없으면 해당 테스트가
+ELF 통합 테스트에는 `gcc`, `nm`, `addr2line`, `objdump`가 필요하며 없으면 해당 테스트가
 skip됩니다. 테스트는 호스트에서 컴파일한 ELF 주소에 합성 Tarmac 이벤트를 연결하는
 방식입니다. 실제 Arm 코어에서 수집한 전체 trace와 사용자 ELF의 검증을 대신하지는
 않습니다. `tests/fixtures`의 로그는 짧은 파서 검증용 예시이며 대응 펌웨어 ELF를
@@ -204,3 +246,4 @@ skip됩니다. 테스트는 호스트에서 컴파일한 ELF 주소에 합성 Ta
 - [Arm Tarmac 이벤트 및 형식 설명](https://github.com/ARM-software/tarmac-trace-utilities/blob/main/doc/index.rst)
 - [Cachegrind 출력 형식](https://valgrind.org/docs/manual/cg-manual.html#cg-manual.impl-details.file-format)
 - [GNU addr2line](https://sourceware.org/binutils/docs/binutils/addr2line.html)
+- [GNU objdump의 명령어 디스어셈블 옵션](https://sourceware.org/binutils/docs/binutils/objdump.html)
