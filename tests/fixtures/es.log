@@ -1,0 +1,12 @@
+Tarmac Text Rev 3t
+         7095 tic ES EXC [1] Reset
+                        R MSP 20020000
+                        R XPSR f9000000
+                        BR (000226f8) T
+         7097 tic ES (000226f8:f2400000) T thrd: MOVW r0,#0
+                              R R0 00000000
+         7098 tic ES (000226fc:2001) T thrd: MOVS r0,#1
+         7099 tic ES (000226fc:2001) T thrd: MOVS r0,#1
+         7100 tic ES (00022700:2002) T thrd: CCFAIL MOVS r0,#2
+         7101 tic ES (00022702:--------) T thrd:
+                   LD 20000000 ........ ........ ........ 12345678
