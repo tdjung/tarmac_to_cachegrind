@@ -8,7 +8,7 @@ import sys
 import unittest
 from unittest.mock import patch
 
-import tarmac_batch_to_cachegrind as batch
+import tarmac_to_cachegrind as batch
 import test_converter as single_tests
 
 ROOT = single_tests.ROOT
@@ -49,8 +49,14 @@ class BatchTests(unittest.TestCase):
             folder = root / "case{:03d}".format(index)
             self.log(folder / "tarmac_a.log")
             self.log(folder / "tarmac_b.log", "it")
-        with patch.object(subprocess, "run", wraps=subprocess.run) as calls, patch("sys.stderr", io.StringIO()):
+        with patch.object(subprocess, "run", wraps=subprocess.run) as calls, patch("sys.stderr", io.StringIO()) as progress, patch("builtins.print", wraps=print) as prints:
             self.assertEqual(batch.main(self.args(root)), 0)
+        self.assertIn('[1/800] complete "case000_tarmac_a_cachegrind.out"', progress.getvalue())
+        self.assertIn('[800/800] complete "case399_tarmac_b_cachegrind.out"', progress.getvalue())
+        self.assertIn('complete "total_merge_cachegrind.out"', progress.getvalue())
+        completion_calls = [call for call in prints.call_args_list if "complete " in str(call[0][0])]
+        self.assertEqual(len(completion_calls), 802)  # 800 profiles, total, report
+        self.assertTrue(all(call[1].get("flush") is True for call in completion_calls))
         # One objdump plus one addr2line batch for this small ELF, not 800 each.
         self.assertEqual(calls.call_count, 2)
         output = root / "cachegrind-output"
@@ -103,7 +109,7 @@ class BatchTests(unittest.TestCase):
         root = self.fixture("fallback")
         self.log(root / "tarmac_one.log")
         result = subprocess.run([
-            sys.executable, str(ROOT / "tarmac_batch_to_cachegrind.py"), str(root),
+            sys.executable, str(ROOT / "tarmac_to_cachegrind.py"), str(root),
             "--elf", str(self.elf), "--objdump", shutil.which("objdump"),
         ], env=dict(os.environ, PATH=str(root / "missing-tools")),
             universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -111,6 +117,24 @@ class BatchTests(unittest.TestCase):
         self.assertIn("using objdump -l", result.stderr)
         merged = (root / "cachegrind-output" / "total_merge_cachegrind.out").read_text()
         self.assertIn("fn=work\n1 1\n", merged)
+
+    def test_copied_single_script_supports_file_and_directory(self):
+        root = self.fixture("standalone")
+        script = root / "converter.py"
+        shutil.copyfile(str(ROOT / "tarmac_to_cachegrind.py"), str(script))
+        logs = root / "logs"
+        self.log(logs / "tarmac_one.log")
+        for source, output in ((logs / "tarmac_one.log", root / "single.out"),
+                               (logs, root / "batch-out")):
+            result = subprocess.run([
+                sys.executable, str(script), str(source), "--elf", str(self.elf),
+                "--addr2line", shutil.which("addr2line"), "--objdump", shutil.which("objdump"),
+                "-o", str(output),
+            ], cwd=str(root), universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("complete ", result.stderr)
+        self.assertIn("fn=work\n1 1\n", (root / "single.out").read_text())
+        self.assertTrue((root / "batch-out" / "total_merge_cachegrind.out").exists())
 
 
 if __name__ == "__main__":

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Convert one core's Tarmac trace to a flat, Ir-only Cachegrind profile."""
+"""Convert a Tarmac log or a folder of scenarios to flat Cachegrind profiles."""
 
 import argparse
 from collections import Counter, namedtuple
 from contextlib import contextmanager
 import csv
 import gzip
+import fnmatch
 import json
 import os
 from pathlib import Path
@@ -348,11 +349,155 @@ def integer(value: str) -> int:
         raise argparse.ArgumentTypeError("expected an integer, e.g. 0 or 0x20000000") from exc
 
 
+class ProfileContext:
+    """Keep ELF instruction/source analysis and unknown-PC results across logs."""
+
+    def __init__(self, args):
+        self.elf = args.elf
+        self.offset = args.load_offset
+        self.addr2line = find_addr2line(args.addr2line)
+        self.sources = {}
+        self.baseline = Counter()
+        self.elf_pc_count = 0
+        self.fallback = None
+        if not args.executed_only or self.addr2line is None:
+            objdump = find_objdump(args.objdump, self.addr2line)
+            dump = disassemble(self.elf, objdump, with_lines=self.addr2line is None)
+            if self.addr2line is None:
+                print("info: addr2line not found; using objdump -l", file=sys.stderr)
+                self.fallback = objdump_sources(dump)
+                pcs = set(self.fallback)
+            else:
+                pcs = instruction_pcs(dump)
+            if not pcs:
+                raise ConversionError("objdump found no executable instructions in the ELF")
+            if not args.executed_only:
+                runtime = Counter()
+                self.elf_pc_count = seed_pcs(runtime, pcs, self.offset)
+                self.resolve(runtime)
+                for source in self.sources.values():
+                    self.baseline[source] = 0
+
+    def resolve(self, pcs):
+        missing = set(pcs).difference(self.sources)
+        if any(pc - self.offset < 0 for pc in missing):
+            raise ConversionError("--load-offset produces a negative ELF address")
+        if self.addr2line is not None:
+            self.sources.update(resolve_pcs(
+                missing, self.elf, self.addr2line, load_offset=self.offset))
+        else:
+            self.sources.update({pc: self.fallback.get(pc - self.offset, Source())
+                                 for pc in missing})
+
+    def costs(self, counts, stats):
+        self.resolve(counts)
+        stats.elf_instruction_pcs = self.elf_pc_count
+        costs = self.baseline.copy()
+        # Counter.update preserves zero entries, unlike Counter addition.
+        costs.update(aggregate(counts, self.sources, stats))
+        return costs
+
+
+def discover(root, patterns, output_dir):
+    """Filename filter; do not follow directory/file symlinks or scan outputs."""
+    found = []
+    for directory, dirs, names in os.walk(str(root), followlinks=False):
+        dirs[:] = sorted(name for name in dirs
+                         if not (Path(directory) / name).is_symlink()
+                         and (Path(directory) / name).resolve() != output_dir)
+        for name in sorted(names):
+            path = Path(directory) / name
+            if path.is_file() and not path.is_symlink() and any(fnmatch.fnmatchcase(name, p) for p in patterns):
+                found.append(path)
+    return sorted(found)
+
+
+def output_name(path, root):
+    relative = path.relative_to(root)
+    name = relative.name
+    if name.endswith(".gz"):
+        name = name[:-3]
+    if name.endswith(".log"):
+        name = name[:-4]
+    folders = relative.parts[:-1] or (root.name,)
+    return "_".join(folders + (name, "cachegrind.out"))
+
+
+def run_batch(args):
+    root = Path(args.trace).resolve()
+    output = (args.output_dir or args.output or root / "cachegrind-output").resolve()
+    if not root.is_dir():
+        raise ConversionError("root must be a directory")
+    if output == root:
+        raise ConversionError("output directory must differ from the input root")
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise ConversionError("output directory must be empty; choose a new --output-dir for each run")
+    with args.elf.open("rb") as file:
+        if file.read(4) != b"\x7fELF":
+            raise ConversionError("--elf must point to an ELF file")
+    paths = discover(root, args.pattern or ["tarmac*.log", "tarmac*.log.gz"], output)
+    if not paths:
+        raise ConversionError("no matching logs found")
+    names = [output_name(path, root) for path in paths]
+    if len(set(names)) != len(names):
+        raise ConversionError("output filename collision; narrow --pattern or rename colliding input folders/logs")
+    print("Found {} logs; analyzing ELF...".format(len(paths)), file=sys.stderr, flush=True)
+    context = ProfileContext(args)
+    output.mkdir(parents=True, exist_ok=True)
+    total = context.baseline.copy()
+    report = {"elf": str(args.elf.resolve()), "root": str(root), "matched": len(paths),
+              "successful": [], "failed": [], "total_instructions": 0,
+              "merged_output": None}
+    for index, (path, name) in enumerate(zip(paths, names), 1):
+        try:
+            opener = gzip.open if path.name.endswith(".gz") else open
+            with opener(str(path), "rt", encoding="utf-8-sig", errors="strict") as trace:
+                counts, stats = count_pcs(trace, input_format=args.input_format,
+                                                   allow_empty=not args.executed_only)
+            if not stats.events:
+                raise ConversionError("no Tarmac instruction/exception records; empty or unrelated log")
+            costs = context.costs(counts, stats)
+            if not args.merge_only:
+                with atomic_text(output / name) as file:
+                    write_cachegrind(file, costs, args.elf)
+            total.update(costs)
+            report["total_instructions"] += stats.instructions
+            report["successful"].append({"input": str(path.relative_to(root)),
+                                         "output": None if args.merge_only else name,
+                                         "stats": vars(stats)})
+            action = "processed" if args.merge_only else "complete"
+            label = str(path.relative_to(root)) if args.merge_only else name
+            print("[{}/{}] {} {}".format(index, len(paths), action, json.dumps(label, ensure_ascii=False)), file=sys.stderr, flush=True)
+        except (ConversionError, OSError, UnicodeError, EOFError) as exc:
+            report["failed"].append({"input": str(path.relative_to(root)), "error": str(exc)})
+            print("[{}/{}] FAILED {}: {}".format(index, len(paths), path.relative_to(root), exc), file=sys.stderr, flush=True)
+    if report["successful"]:
+        name = "total_merge_cachegrind.out"
+        with atomic_text(output / name) as file:
+            if report["failed"]:
+                file.write("desc: PARTIAL MERGE: {} of {} logs failed; see batch_report.json\n".format(len(report["failed"]), len(paths)))
+            write_cachegrind(file, total, args.elf)
+        report["merged_output"] = name
+        print("complete " + json.dumps(name), file=sys.stderr, flush=True)
+    with atomic_text(output / "batch_report.json") as file:
+        json.dump(report, file, indent=2, sort_keys=True)
+        file.write("\n")
+    print('complete "batch_report.json"', file=sys.stderr, flush=True)
+    print("Completed: {} succeeded, {} failed; {:,} instructions; {}".format(
+        len(report["successful"]), len(report["failed"]), report["total_instructions"], output), file=sys.stderr, flush=True)
+    return 1 if report["failed"] else 0
+
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("trace", help="one core's Tarmac .log/.gz file, or - for stdin")
+    parser.add_argument("trace", help="Tarmac log, - for stdin, or parent folder for recursive batch conversion")
     parser.add_argument("--elf", required=True, type=Path, help="matching ELF, preferably with DWARF (-g)")
-    parser.add_argument("-o", "--output", required=True, type=Path, help="output cachegrind.out file")
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("-o", "--output", type=Path, help="output file, or empty output directory in batch mode")
+    output.add_argument("--output-dir", type=Path, help="batch output directory (default: ROOT/cachegrind-output)")
+    parser.add_argument("--pattern", action="append", help="batch basename glob, repeatable; default: tarmac*.log and tarmac*.log.gz")
+    parser.add_argument("--merge-only", action="store_true", help="batch: write only merged profile and report")
     parser.add_argument("--format", choices=("auto", "es", "it"), default="auto", dest="input_format")
     parser.add_argument("--addr2line", help="GNU-compatible addr2line (auto-detect by default; use objdump -l if none found)")
     parser.add_argument("--objdump", help="target-compatible objdump for ELF instruction enumeration")
@@ -391,6 +536,14 @@ def validate_paths(args: argparse.Namespace) -> None:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if Path(args.trace).is_dir() or args.output_dir is not None:
+            if args.pc_counts or args.stats or args.skip_malformed:
+                raise ConversionError("--pc-counts, --stats and --skip-malformed are single-log options; batch writes batch_report.json")
+            return run_batch(args)
+        if args.pattern or args.merge_only:
+            raise ConversionError("--pattern and --merge-only require a folder input")
+        if args.output is None:
+            raise ConversionError("single-log conversion requires -o/--output")
         validate_paths(args)
         tool = find_addr2line(args.addr2line)
         options = dict(input_format=args.input_format, skip_malformed=args.skip_malformed,
@@ -433,6 +586,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 out.write("\n")
         with atomic_text(args.output) as out:
             write_cachegrind(out, costs, args.elf)
+        print("complete " + json.dumps(str(args.output), ensure_ascii=False), file=sys.stderr, flush=True)
         print(f"{stats.instructions:,} instructions, {stats.unique_pcs:,} unique PCs -> {args.output}", file=sys.stderr)
         if not stats.instructions:
             print("warning: no executed instructions found; output contains only zero-cost ELF locations", file=sys.stderr)
