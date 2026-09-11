@@ -3,9 +3,12 @@
 두 가지 Arm Tarmac 로그 형식의 **PC별 명령어 실행 횟수**를 ELF와 결합해
 함수·파일·소스 라인별 **flat Cachegrind 프로파일**로 변환합니다.
 
-Python 표준 라이브러리와 GNU 호환 `addr2line`, 대상 코어용 `objdump`를 사용합니다.
+Python 표준 라이브러리와 대상 코어용 `objdump`를 사용하며, 소스 위치 조회에는
+GNU 호환 `addr2line`을 우선 사용합니다. 자동 탐색으로도 찾지 못하면 objdump의
+라인 번호 출력을 파싱합니다.
 기본적으로 ELF의 명령어 주소를 `Ir=0`으로 포함하고 trace 실행 횟수를 더합니다.
-로그는 한 줄씩 읽고, ELF/trace의 고유 PC별 횟수를 모은 후 `addr2line`에 일괄 질의합니다.
+로그는 한 줄씩 읽고, ELF/trace의 고유 PC별 횟수를 모읍니다. addr2line을 사용하는
+경우 주소를 일괄 질의합니다.
 전체 로그를 메모리에 올리거나 명령어 실행마다 외부 프로세스를 만들지 않습니다.
 
 출력 이벤트는 `Ir` 하나입니다. **call graph, 호출 횟수, inclusive cost,
@@ -18,6 +21,7 @@ Python 표준 라이브러리와 GNU 호환 `addr2line`, 대상 코어용 `objdu
 - 해당 ELF를 읽을 수 있는 `addr2line`:
   `arm-none-eabi-addr2line`, `llvm-addr2line`, `addr2line` 순으로 자동 탐색합니다.
   여러 toolchain이 있으면 `--addr2line`으로 직접 지정하세요.
+  이 옵션을 생략하고 위 실행 파일을 모두 찾지 못한 경우에는 `objdump -l`로 전환합니다.
 - 해당 ELF를 디스어셈블할 수 있는 `objdump`. 선택된 `addr2line`과 같은 toolchain을
   우선 탐색하며, `--objdump arm-none-eabi-objdump`처럼 직접 지정할 수 있습니다.
   호스트용 `objdump`가 Arm을 지원하지 않으면 Arm toolchain을 지정하세요.
@@ -163,8 +167,9 @@ CSV에도 미실행 PC를 `Ir=0`으로 포함합니다. JSON의 `unique_pcs`는 
 뷰어가 0인 항목을 숨기면 표시 필터를 조정하세요. `cg_annotate`에서는
 `--threshold=0 --show=Ir --sort=Ir`로 확인할 수 있습니다.
 
-기존처럼 실행된 PC만 처리하려면 다음과 같이 실행합니다. 이 모드에는 objdump가
-필요 없고 대형 ELF 전체를 탐색하지 않습니다.
+기존처럼 실행된 PC만 처리하려면 다음과 같이 실행합니다. addr2line을 사용할 수 있으면
+이 모드에는 objdump가 필요 없고 대형 ELF 전체를 탐색하지 않습니다. addr2line이 없으면
+소스 위치를 얻기 위해 objdump가 필요하지만 출력에는 실행된 PC만 포함합니다.
 
 ```bash
 python3 tarmac_to_cachegrind.py core0.log --elf core0.elf \
@@ -179,6 +184,27 @@ PC가 ELF 범위를 벗어나도 해당 비용을 버리지 않습니다.
 Inlining은 `addr2line -f -C`의 단일 결과에 한 번만 귀속합니다(`-i` 미사용).
 인라인 호출 계층을 만들지 않습니다. 최적화로 인한 라인 매핑의 모호함, 심볼 alias,
 별도 이미지/overlay, self-modifying code를 복원하지 않습니다.
+
+### addr2line이 없는 환경
+
+`--addr2line`을 생략하면 기존 순서로 자동 탐색합니다. 모두 없으면 stderr에 전환
+메시지를 출력하고 `objdump -d -z --no-show-raw-insn -l -C`를 한 번 실행해 명령어
+주소와 소스 위치를 함께 수집합니다. 추가 설치 없이 다음처럼 사용할 수 있습니다.
+
+```bash
+python3 tarmac_to_cachegrind.py core0.log --elf core0.elf \
+  --objdump arm-none-eabi-objdump -o cachegrind.out.core0
+```
+
+fallback에서는 디스어셈블의 함수 심볼과 파일/라인 표기를 사용합니다. 함수·섹션이
+바뀌면 이전 라인 정보를 초기화하며, objdump에 없는 trace PC는 주변 라인으로
+추정하지 않고 `???`/라인 0으로 보존합니다. ELF에 디버그 정보가 없으면 objdump도
+소스 라인을 복원할 수 없습니다. 인라인 함수/최적화 코드의 귀속은 addr2line 경로와
+다를 수 있고, fallback의 함수명은 디스어셈블의 enclosing symbol을 기준으로 합니다.
+
+명시적으로 지정한 `--addr2line` 경로가 없거나, 발견한 addr2line이 실행 중 실패하면
+오류로 처리합니다. 자동 전환은 **옵션을 생략했고 자동 탐색에서도 찾지 못했을 때만**
+발생합니다. objdump까지 없거나 실행에 실패하면 변환을 중단합니다.
 
 ## 진단 및 추가 옵션
 
@@ -223,7 +249,7 @@ gzip -dc core0.log.gz | python3 tarmac_to_cachegrind.py - --elf core0.elf -o cac
 python3 -m unittest discover -s tests -v
 ```
 
-Python 3.6.8 및 3.12.14 인터프리터에서 아래 25개 테스트의 통과를 확인했습니다.
+Python 3.6.8 및 3.12.14 인터프리터에서 아래 30개 테스트의 통과를 확인했습니다.
 `dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,
@@ -232,6 +258,8 @@ Python 3.6.8 및 3.12.14 인터프리터에서 아래 25개 테스트의 통과�
   offset, gzip/stdin, 미해결 주소 및 비용 보존.
 - 미실행 함수의 0 비용, 데이터 제외, 같은 라인의 0/양수 비용 합산, 빈 trace,
   실행 PC 전용 모드 및 잘못된 objdump 지정 시 기존 출력 보존.
+- addr2line 없는 PATH에서 실제 objdump fallback: 두 trace 형식, offset, CSV,
+  미실행 함수, 실행 PC 전용 모드, 미해결 PC 보존 및 명시적 도구 경로 오류.
 - `cg_annotate`가 설치되어 있으면 생성한 프로파일을 실제 reader로 검증합니다.
   전체 검증을 위해 GCC/binutils/Valgrind를 설치한 환경에서 테스트를 실행하세요.
 

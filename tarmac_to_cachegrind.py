@@ -129,7 +129,7 @@ def count_pcs(
     return counts, stats
 
 
-def find_addr2line(explicit: Optional[str]) -> str:
+def find_addr2line(explicit: Optional[str]) -> Optional[str]:
     candidates = [explicit] if explicit else [
         "arm-none-eabi-addr2line", "llvm-addr2line", "addr2line"
     ]
@@ -137,6 +137,8 @@ def find_addr2line(explicit: Optional[str]) -> str:
         found = shutil.which(candidate)
         if found:
             return found
+    if not explicit:
+        return None
     raise ConversionError(
         "addr2line not found; install Arm GNU binutils or LLVM, "
         "then pass --addr2line /path/to/arm-none-eabi-addr2line"
@@ -195,14 +197,14 @@ def resolve_pcs(
     return sources
 
 
-def find_objdump(explicit: Optional[str], addr2line: str) -> str:
+def find_objdump(explicit: Optional[str], addr2line: Optional[str]) -> str:
     # Prefer the same toolchain as the selected symbolizer.
-    sibling = re.sub(r"addr2line(?=(?:\.exe)?$)", "objdump", addr2line)
+    sibling = re.sub(r"addr2line(?=(?:\.exe)?$)", "objdump", addr2line) if addr2line else None
     candidates = [explicit] if explicit else [
         sibling, "arm-none-eabi-objdump", "llvm-objdump", "objdump"
     ]
     for candidate in candidates:
-        if candidate == addr2line:
+        if not candidate or candidate == addr2line:
             continue
         found = shutil.which(candidate)
         if found:
@@ -224,12 +226,14 @@ def instruction_pcs(disassembly: str):
     return pcs
 
 
-def seed_elf_pcs(counts: CounterType[int], elf: Path, tool: str,
-                 load_offset: int = 0) -> int:
-    """Seed executable instruction starts with zero; keep observed counts intact."""
+def disassemble(elf: Path, tool: str, with_lines: bool = False) -> str:
+    command = [tool, "-d", "-z", "--no-show-raw-insn"]
+    if with_lines:
+        command.extend(["-l", "-C"])
+    command.append(str(elf.resolve()))
     try:
         result = subprocess.run(
-            [tool, "-d", "-z", "--no-show-raw-insn", str(elf.resolve())],
+            command,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             universal_newlines=True, encoding="utf-8", errors="replace",
             env=dict(os.environ, LC_ALL="C"), timeout=120, check=False,
@@ -238,7 +242,38 @@ def seed_elf_pcs(counts: CounterType[int], elf: Path, tool: str,
         raise ConversionError(f"cannot run objdump: {exc}") from exc
     if result.returncode:
         raise ConversionError(f"objdump failed (check the target toolchain): {result.stderr.strip()}")
-    pcs = instruction_pcs(result.stdout)
+    return result.stdout
+
+
+def objdump_sources(disassembly: str) -> Dict[int, Source]:
+    """Parse objdump -d -l -C; source annotations apply until the next one.
+
+    Function/section boundaries clear the source context. Only exact instruction
+    starts are indexed: an unmatched trace PC must not inherit a nearby line.
+    """
+    sources = {}  # type: Dict[int, Source]
+    function, filename, line_number = "???", "???", 0
+    for raw in disassembly.splitlines():
+        line = raw.strip()
+        symbol = re.match(r"^[0-9a-fA-F]+ <(.+)>:$", line)
+        if line.startswith("Disassembly of section ") or symbol:
+            function = re.sub(r"\+0x[0-9a-fA-F]+$", "", symbol.group(1)) if symbol else "???"
+            filename, line_number = "???", 0
+            continue
+        location = LOCATION.fullmatch(line.lstrip("; "))
+        if location:
+            filename, number = location.groups()
+            filename = filename if filename not in ("", "??", "???") else "???"
+            line_number = int(number) if number != "?" else 0
+            continue
+        pcs = instruction_pcs(raw)
+        for pc in pcs:
+            sources[pc] = Source(filename, function, line_number)
+    return sources
+
+
+def seed_pcs(counts: CounterType[int], pcs: Iterable[int], load_offset: int) -> int:
+    pcs = set(pcs)
     if not pcs:
         raise ConversionError("objdump found no executable instructions in the ELF")
     for pc in pcs:
@@ -247,6 +282,12 @@ def seed_elf_pcs(counts: CounterType[int], elf: Path, tool: str,
             raise ConversionError("--load-offset produces a negative runtime address")
         counts.setdefault(runtime_pc, 0)
     return len(pcs)
+
+
+def seed_elf_pcs(counts: CounterType[int], elf: Path, tool: str,
+                 load_offset: int = 0) -> int:
+    """Seed executable instruction starts with zero; keep observed counts intact."""
+    return seed_pcs(counts, instruction_pcs(disassemble(elf, tool)), load_offset)
 
 
 def aggregate(counts: CounterType[int], sources: Dict[int, Source], stats: Stats) -> CounterType[Source]:
@@ -313,7 +354,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--elf", required=True, type=Path, help="matching ELF, preferably with DWARF (-g)")
     parser.add_argument("-o", "--output", required=True, type=Path, help="output cachegrind.out file")
     parser.add_argument("--format", choices=("auto", "es", "it"), default="auto", dest="input_format")
-    parser.add_argument("--addr2line", help="GNU-compatible addr2line executable (auto-detected by default)")
+    parser.add_argument("--addr2line", help="GNU-compatible addr2line (auto-detect by default; use objdump -l if none found)")
     parser.add_argument("--objdump", help="target-compatible objdump for ELF instruction enumeration")
     parser.add_argument("--executed-only", action="store_true", help="omit unexecuted ELF locations (legacy behavior; no objdump needed)")
     parser.add_argument("--load-offset", type=integer, default=0, help="runtime PC minus ELF address (decimal/hex)")
@@ -360,11 +401,23 @@ def main(argv: Optional[List[str]] = None) -> int:
             opener = gzip.open if args.trace.lower().endswith(".gz") else open
             with opener(args.trace, "rt", encoding="utf-8-sig", errors="strict") as trace:
                 counts, stats = count_pcs(trace, **options)
-        if not args.executed_only:
-            stats.elf_instruction_pcs = seed_elf_pcs(
-                counts, args.elf, find_objdump(args.objdump, tool), args.load_offset
-            )
-        sources = resolve_pcs(counts, args.elf, tool, load_offset=args.load_offset)
+        if tool is None:
+            print("info: addr2line not found on PATH; using objdump -l for source locations", file=sys.stderr)
+            dump = disassemble(args.elf, find_objdump(args.objdump, None), with_lines=True)
+            elf_sources = objdump_sources(dump)
+            if not elf_sources:
+                raise ConversionError("objdump found no executable instructions in the ELF")
+            if not args.executed_only:
+                stats.elf_instruction_pcs = seed_pcs(counts, elf_sources, args.load_offset)
+            if any(pc - args.load_offset < 0 for pc in counts):
+                raise ConversionError("--load-offset produces a negative ELF address")
+            sources = {pc: elf_sources.get(pc - args.load_offset, Source()) for pc in counts}
+        else:
+            if not args.executed_only:
+                stats.elf_instruction_pcs = seed_elf_pcs(
+                    counts, args.elf, find_objdump(args.objdump, tool), args.load_offset
+                )
+            sources = resolve_pcs(counts, args.elf, tool, load_offset=args.load_offset)
         costs = aggregate(counts, sources, stats)
         if args.pc_counts:
             with atomic_text(args.pc_counts) as out:

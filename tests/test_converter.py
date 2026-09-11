@@ -5,6 +5,7 @@ import csv
 import gzip
 import io
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -90,6 +91,36 @@ class ParserTests(unittest.TestCase):
 
 
 class ProfileTests(unittest.TestCase):
+    def test_addr2line_auto_discovery_and_explicit_failure(self):
+        with patch.object(converter.shutil, "which", return_value=None) as which:
+            self.assertIsNone(converter.find_addr2line(None))
+            self.assertEqual([call[0][0] for call in which.call_args_list],
+                             ["arm-none-eabi-addr2line", "llvm-addr2line", "addr2line"])
+            with self.assertRaises(converter.ConversionError):
+                converter.find_addr2line("/missing/addr2line")
+        with patch.object(converter.shutil, "which", side_effect=[None, "/tools/llvm-addr2line"]) as which:
+            self.assertEqual(converter.find_addr2line(None), "/tools/llvm-addr2line")
+            self.assertEqual(which.call_count, 2)
+
+    def test_objdump_line_context_and_unknown_boundaries(self):
+        sources = converter.objdump_sources(
+            "Disassembly of section .text:\n"
+            "00001000 <foo(int)>:\nfoo(int):\n"
+            "C:/src/a.cpp:12 (discriminator 2)\n"
+            " 1000: movw r0, #0\n 1004: bx lr\n"
+            "C:/src/a.cpp:13\n 1006: nop\n"
+            " 1008: .word 0x1234\n"
+            "00001010 <bar>:\n 1010: bx lr\n"
+            "Disassembly of section .other:\n 2000: nop\n"
+        )
+        self.assertEqual(sources[0x1000], converter.Source("C:/src/a.cpp", "foo(int)", 12))
+        self.assertEqual(sources[0x1004], sources[0x1000])
+        self.assertEqual(sources[0x1006].line, 13)
+        self.assertNotIn(0x1008, sources)
+        self.assertNotIn(0x1002, sources)
+        self.assertEqual(sources[0x1010], converter.Source(function="bar"))
+        self.assertEqual(sources[0x2000], converter.Source())
+
     def test_instruction_boundaries_exclude_arm_literal_pool(self):
         self.assertEqual(converter.instruction_pcs(
             "Disassembly of section .text:\n"
@@ -231,6 +262,52 @@ class IntegrationTests(unittest.TestCase):
                     self.assertEqual(annotated.returncode, 0, annotated.stderr)
                     self.assertIn("PROGRAM TOTALS", annotated.stdout)
         self.assertEqual(profiles[0], profiles[1])
+
+    def fallback_cli(self, output, trace, *extra):
+        # Use a real objdump but hide all symbolizers from the child PATH.
+        return subprocess.run([
+            sys.executable, str(ROOT / "tarmac_to_cachegrind.py"), "-",
+            "--elf", str(self.elf), "--objdump", shutil.which("objdump"),
+            "-o", str(output), *map(str, extra),
+        ], input=trace, env=dict(os.environ, PATH=str(self.directory / "no-tools")),
+            universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def test_fallback_real_objdump_both_dialects_and_offset(self):
+        for dialect in ("es", "it"):
+            with self.subTest(dialect=dialect):
+                output = self.directory / "fallback.out"
+                audit = self.directory / "fallback.csv"
+                result = self.fallback_cli(output, self.trace(dialect, 0x20000000),
+                                           "--load-offset", "0x20000000", "--pc-counts", audit)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("using objdump -l", result.stderr)
+                profile = output.read_text()
+                self.assertIn("fn=work\n1 3\n", profile)
+                self.assertIn("fn=main\n2 2\n", profile)
+                self.assertIn("fn=never_called\n3 0\n", profile)
+                self.assertTrue(profile.endswith("summary: 5\n"))
+                with audit.open() as file:
+                    rows = list(csv.DictReader(file))
+                self.assertEqual(sum(int(row["Ir"]) for row in rows), 5)
+
+    def test_fallback_executed_only_and_unknown_pc(self):
+        output = self.directory / "fallback-executed.out"
+        result = self.fallback_cli(output, self.trace("es") + "\nIT 00000001 2000 T16 MOVS r0,#0",
+                                   "--executed-only")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        profile = output.read_text()
+        self.assertNotIn("never_called", profile)
+        self.assertIn("fn=work\n1 3\n", profile)
+        self.assertIn("fl=???\nfn=???\n0 1\n", profile)
+        self.assertTrue(profile.endswith("summary: 6\n"))
+
+    def test_explicit_missing_addr2line_does_not_fallback(self):
+        output = self.directory / "explicit-missing.out"
+        output.write_text("original")
+        result = self.fallback_cli(output, self.trace("it"), "--addr2line", "/missing/addr2line")
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("using objdump -l", result.stderr)
+        self.assertEqual(output.read_text(), "original")
 
     def test_gzip_stdin_and_load_offset(self):
         offset = 0x20000000
