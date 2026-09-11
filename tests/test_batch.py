@@ -89,14 +89,14 @@ class BatchTests(unittest.TestCase):
         self.assertNotIn("desc:", (output / "total_merge_cachegrind.out").read_text())
         self.assertTrue((output / "total_merge_cachegrind.out").read_text().startswith("# callgrind format\n"))
 
-    def test_pattern_merge_only_and_existing_output_protection(self):
+    def test_pattern_merge_only_rerun_replaces_not_accumulates(self):
         root = self.fixture("pattern")
         self.log(root / "case" / "tarmac_core0.log")
         self.log(root / "case" / "tarmac_core1.log")
         args = self.args(root, "--pattern", "tarmac_core0*.log", "--merge-only")
         with patch("sys.stderr", io.StringIO()):
             self.assertEqual(batch.main(args), 0)
-            self.assertEqual(batch.main(args), 1)
+            self.assertEqual(batch.main(args), 0)
         output = root / "cachegrind-output"
         self.assertEqual({p.name for p in output.iterdir()}, {"batch_report.json", "total_merge_cachegrind.out"})
         self.assertTrue((output / "total_merge_cachegrind.out").read_text().endswith("summary: 1\n"))
@@ -133,6 +133,74 @@ class BatchTests(unittest.TestCase):
     def test_negative_depth_is_rejected(self):
         with patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
             batch.build_parser().parse_args(["logs", "--elf", "firmware.elf", "--max-depth", "-1"])
+
+    def test_exact_names_use_two_elfs_and_preserve_both_merges_on_rerun(self):
+        root = self.fixture("two-cores")
+        self.log(root / "case" / "tarmac_core0.log")
+        other_elf = self.directory / "other.elf"
+        subprocess.run(["gcc", "-g", "-O0", "-no-pie", "-Wl,-Ttext=0x600000",
+                        str(self.source), "-o", str(other_elf)], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        nm = subprocess.run(["nm", str(other_elf)], check=True, universal_newlines=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        other_pc = next(int(line.split()[0], 16) for line in nm.stdout.splitlines() if line.endswith(" T work"))
+        self.assertNotEqual(other_pc, self.pcs["work"])
+        other_log = root / "case" / "tarmac_core1.log"
+        self.log(other_log, "it")
+        other_log.write_text(other_log.read_text().replace("{:08x}".format(self.pcs["work"]), "{:08x}".format(other_pc)))
+        args0 = self.args(root, "--log-name", "tarmac_core0.log")
+        args1 = self.args(root, "--log-name", "tarmac_core1.log", "--elf", str(other_elf))
+        with patch("sys.stderr", io.StringIO()):
+            self.assertEqual(batch.main(args0), 0)
+            self.assertEqual(batch.main(args1), 0)
+        output = root / "cachegrind-output"
+        merge0 = output / "total_merge_tarmac_core0_cachegrind.out"
+        merge1 = output / "total_merge_tarmac_core1_cachegrind.out"
+        expected1 = merge1.read_text()
+        self.assertIn("0x{:x} 1 1\n".format(other_pc), expected1)
+        self.assertIn('ob: "{}"'.format(other_elf), expected1)
+        merge0.write_text("old")
+        individual = output / "case_tarmac_core0_cachegrind.out"
+        individual.write_text("old")
+        (output / "keep.txt").write_text("keep")
+        with patch("sys.stderr", io.StringIO()):
+            self.assertEqual(batch.main(args0), 0)
+        self.assertIn("0x{:x} 1 1\n".format(self.pcs["work"]), merge0.read_text())
+        self.assertTrue(individual.read_text().endswith("summary: 1\n"))
+        self.assertEqual(merge1.read_text(), expected1)
+        self.assertEqual((output / "keep.txt").read_text(), "keep")
+        for core in (0, 1):
+            report = json.loads((output / "batch_report_tarmac_core{}.json".format(core)).read_text())
+            self.assertEqual(report["matched"], 1)
+            self.assertEqual(report["log_name"], "tarmac_core{}.log".format(core))
+
+    def test_log_name_is_literal_not_glob(self):
+        root = self.fixture("literal")
+        self.log(root / "tarmac[0].log")
+        self.log(root / "tarmac0.log")
+        found = batch.discover(root, [], root / "out", log_name="tarmac[0].log")
+        self.assertEqual([p.name for p in found], ["tarmac[0].log"])
+
+    def test_log_name_rejects_path_and_conflicting_pattern(self):
+        for options in (["--log-name", "a/b.log"],
+                        ["--log-name", "tarmac.log", "--pattern", "*.log"]):
+            with patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+                batch.build_parser().parse_args(["logs", "--elf", "x.elf"] + options)
+
+    def test_failed_rerun_reports_preserved_old_files(self):
+        root = self.fixture("failed-rerun")
+        log = root / "tarmac.log"
+        self.log(log)
+        args = self.args(root, "--log-name", "tarmac.log")
+        with patch("sys.stderr", io.StringIO()):
+            self.assertEqual(batch.main(args), 0)
+            log.write_text("IT broken")
+            self.assertEqual(batch.main(args), 1)
+        output = root / "cachegrind-output"
+        report = json.loads((output / "batch_report_tarmac.json").read_text())
+        self.assertIsNone(report["merged_output"])
+        self.assertEqual(len(report["preserved_previous_outputs"]), 2)
+        self.assertIn("total_merge_tarmac_cachegrind.out", report["preserved_previous_outputs"])
 
     def test_real_cli_fallback(self):
         root = self.fixture("fallback")

@@ -360,6 +360,12 @@ def nonnegative_integer(value):
     return number
 
 
+def log_basename(value):
+    if not value or value in (".", "..") or "/" in value or "\\" in value:
+        raise argparse.ArgumentTypeError("--log-name requires a filename, not a path")
+    return value
+
+
 class ProfileContext:
     """Keep ELF instruction/source analysis and unknown-PC results across logs."""
 
@@ -409,7 +415,7 @@ class ProfileContext:
         return costs
 
 
-def discover(root, patterns, output_dir, max_depth=1):
+def discover(root, patterns, output_dir, max_depth=1, log_name=None):
     """Depth 0 scans root only; prune traversal before opening deeper folders."""
     if max_depth < 0:
         raise ConversionError("--max-depth must be non-negative")
@@ -423,7 +429,8 @@ def discover(root, patterns, output_dir, max_depth=1):
                 if path == output_dir:
                     continue
                 # Filter names before file metadata calls; never resolve each path.
-                if any(fnmatch.fnmatchcase(entry.name, p) for p in patterns):
+                if (entry.name == log_name if log_name is not None else
+                        any(fnmatch.fnmatchcase(entry.name, p) for p in patterns)):
                     if entry.is_file(follow_symlinks=False):
                         found.append(path)
                         continue
@@ -450,14 +457,14 @@ def run_batch(args):
         raise ConversionError("root must be a directory")
     if output == root:
         raise ConversionError("output directory must differ from the input root")
-    if output.exists() and (not output.is_dir() or any(output.iterdir())):
-        raise ConversionError("output directory must be empty; choose a new --output-dir for each run")
+    if output.exists() and not output.is_dir():
+        raise ConversionError("output path must be a directory")
     with args.elf.open("rb") as file:
         if file.read(4) != b"\x7fELF":
             raise ConversionError("--elf must point to an ELF file")
     print("Searching {} (max-depth={})...".format(root, args.max_depth), file=sys.stderr, flush=True)
     started = time.monotonic()
-    paths = discover(root, args.pattern or ["tarmac*.log", "tarmac*.log.gz"], output, args.max_depth)
+    paths = discover(root, args.pattern or ["tarmac*.log", "tarmac*.log.gz"], output, args.max_depth, args.log_name)
     print("Search complete: {} logs in {:.2f}s".format(len(paths), time.monotonic() - started), file=sys.stderr, flush=True)
     if not paths:
         raise ConversionError("no matching logs found")
@@ -470,9 +477,20 @@ def run_batch(args):
     print("ELF analysis complete in {:.2f}s".format(time.monotonic() - started), file=sys.stderr, flush=True)
     output.mkdir(parents=True, exist_ok=True)
     total = context.baseline.copy()
+    tag = ""
+    if args.log_name:
+        tag = args.log_name
+        if tag.endswith(".gz"):
+            tag = tag[:-3]
+        if tag.endswith(".log"):
+            tag = tag[:-4]
+        tag = "_" + tag
+    merge_name = "total_merge" + tag + "_cachegrind.out"
+    report_name = "batch_report" + tag + ".json"
     report = {"elf": str(args.elf.resolve()), "root": str(root), "matched": len(paths),
               "successful": [], "failed": [], "total_instructions": 0,
-              "merged_output": None, "max_depth": args.max_depth, "partial_merge": False}
+              "merged_output": None, "max_depth": args.max_depth, "partial_merge": False,
+              "log_name": args.log_name, "preserved_previous_outputs": []}
     for index, (path, name) in enumerate(zip(paths, names), 1):
         try:
             opener = gzip.open if path.name.endswith(".gz") else open
@@ -495,20 +513,26 @@ def run_batch(args):
             print("[{}/{}] {} {}".format(index, len(paths), action, json.dumps(label, ensure_ascii=False)), file=sys.stderr, flush=True)
         except (ConversionError, OSError, UnicodeError, EOFError) as exc:
             report["failed"].append({"input": str(path.relative_to(root)), "error": str(exc)})
+            if not args.merge_only and (output / name).exists():
+                report["preserved_previous_outputs"].append(name)
+                print("warning: previous output preserved, excluded from this merge: " + name, file=sys.stderr, flush=True)
             print("[{}/{}] FAILED {}: {}".format(index, len(paths), path.relative_to(root), exc), file=sys.stderr, flush=True)
     if report["successful"]:
-        name = "total_merge_cachegrind.out"
+        name = merge_name
         with atomic_text(output / name) as file:
             write_cachegrind(file, total, args.elf)
         if report["failed"]:
             report["partial_merge"] = True
-            print("warning: PARTIAL MERGE: {} logs failed; see batch_report.json".format(len(report["failed"])), file=sys.stderr, flush=True)
+            print("warning: PARTIAL MERGE: {} logs failed; see {}".format(len(report["failed"]), report_name), file=sys.stderr, flush=True)
         report["merged_output"] = name
         print("complete " + json.dumps(name), file=sys.stderr, flush=True)
-    with atomic_text(output / "batch_report.json") as file:
+    if not report["successful"] and (output / merge_name).exists():
+        report["preserved_previous_outputs"].append(merge_name)
+        print("warning: all logs failed; previous merge was not updated: " + merge_name, file=sys.stderr, flush=True)
+    with atomic_text(output / report_name) as file:
         json.dump(report, file, indent=2, sort_keys=True)
         file.write("\n")
-    print('complete "batch_report.json"', file=sys.stderr, flush=True)
+    print("complete " + json.dumps(report_name), file=sys.stderr, flush=True)
     print("Completed: {} succeeded, {} failed; {:,} instructions; {}".format(
         len(report["successful"]), len(report["failed"]), report["total_instructions"], output), file=sys.stderr, flush=True)
     return 1 if report["failed"] else 0
@@ -520,9 +544,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("trace", help="Tarmac log, - for stdin, or parent folder for recursive batch conversion")
     parser.add_argument("--elf", required=True, type=Path, help="matching ELF, preferably with DWARF (-g)")
     output = parser.add_mutually_exclusive_group()
-    output.add_argument("-o", "--output", type=Path, help="output file, or empty output directory in batch mode")
+    output.add_argument("-o", "--output", type=Path, help="output file, or output directory in batch mode (existing files replaced)")
     output.add_argument("--output-dir", type=Path, help="batch output directory (default: ROOT/cachegrind-output)")
-    parser.add_argument("--pattern", action="append", help="batch basename glob, repeatable; default: tarmac*.log and tarmac*.log.gz")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--log-name", type=log_basename, help="batch: exact filename for this ELF (e.g. tarmac_core0.log); tags merge/report filenames")
+    selection.add_argument("--pattern", action="append", help="batch basename glob, repeatable; default: tarmac*.log and tarmac*.log.gz")
     parser.add_argument("--max-depth", type=nonnegative_integer, default=1, help="batch directory depth: 0=root only, 1=root and immediate children (default)")
     parser.add_argument("--merge-only", action="store_true", help="batch: write only merged profile and report")
     parser.add_argument("--format", choices=("auto", "es", "it"), default="auto", dest="input_format")
@@ -567,8 +593,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             if args.pc_counts or args.stats or args.skip_malformed:
                 raise ConversionError("--pc-counts, --stats and --skip-malformed are single-log options; batch writes batch_report.json")
             return run_batch(args)
-        if args.pattern or args.merge_only:
-            raise ConversionError("--pattern and --merge-only require a folder input")
+        if args.pattern or args.log_name or args.merge_only:
+            raise ConversionError("--pattern, --log-name and --merge-only require a folder input")
         if args.output is None:
             raise ConversionError("single-log conversion requires -o/--output")
         validate_paths(args)

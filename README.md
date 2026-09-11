@@ -78,8 +78,9 @@ python3 tarmac_to_cachegrind.py /work/test_results \
 - 먼저 파일명으로 후보를 좁히고 실제 변환 파서로 검증합니다. 모든 `.log`의 내용을
   별도로 탐색하는 이중 읽기를 하지 않습니다. `build.log` 등은 무시하며, 후보 파일에
   Tarmac 명령어/예외 이벤트가 없거나 명령어 형식이 잘못됐으면 실패 목록에 기록합니다.
-- 기본 출력 폴더는 `상위폴더/cachegrind-output`입니다. 매 실행마다 **비어 있는 출력
-  폴더**를 지정하세요. 이전 실행 결과와 섞거나 덮어쓰지 않습니다.
+- 기본 출력 폴더는 `상위폴더/cachegrind-output`입니다. **기존 폴더를 그대로 사용할 수
+  있고 같은 이름의 결과 파일은 성공 시 교체합니다.** 이번 실행에서 선택하지 않은 파일은
+  유지합니다. merge는 과거 출력 파일을 읽지 않고 이번 실행에서 성공한 로그만 합산합니다.
 - 상대 폴더 경로를 `_`로 연결하고 `.log`/`.log.gz`를 제거해 이름을 만듭니다.
   루트 바로 아래의 로그는 상위 폴더 자체의 이름을 붙입니다. 충돌하는 이름이 생기면
   변환 전에 오류로 알리므로 폴더명이나 `--pattern`을 조정하세요.
@@ -115,20 +116,35 @@ python3 tarmac_to_cachegrind.py /work/test_results \
 `--format`, `--executed-only`도 단일 변환기와 같은 방식으로 사용할 수 있습니다.
 addr2line이 자동 탐색되지 않으면 objdump의 라인 정보를 재사용합니다.
 
-### 코어별 ELF가 다를 때
+### 코어별 ELF가 다를 때: 정확한 파일명 선택
 
 **한 배치 실행은 동일한 ELF와 주소 매핑을 사용하는 로그만 선택해야 합니다.**
-두 문법 모두 파싱 가능하다는 것이 두 ELF의 주소 공간을 구분한다는 뜻은 아닙니다.
-파일명만으로 ELF가 일치하는지는 검증할 수 없습니다. 각 폴더의 두 로그가 서로 다른
-코어/ELF를 사용한다면 패턴과 출력 폴더를 분리해서 두 번 실행하세요.
+각 폴더에서 두 코어의 로그 이름이 일정하다면 `--log-name`을 사용하는 것이 적절합니다.
+파일명 전체를 대소문자까지 정확히 비교하며 경로나 glob 패턴으로 해석하지 않습니다.
+기존 `--pattern`과는 동시에 지정할 수 없습니다. 둘 다 생략하면 기존 기본 패턴으로
+모든 후보를 선택하므로, ELF가 다른 두 로그가 있으면 반드시 선택 옵션을 지정하세요.
 
 ```bash
 python3 tarmac_to_cachegrind.py /work/test_results \
-  --elf core0.elf --pattern 'tarmac_core0*.log' -o /work/coverage/core0
+  --elf core0.elf --log-name tarmac_core0.log -o /work/coverage
 
 python3 tarmac_to_cachegrind.py /work/test_results \
-  --elf core1.elf --pattern 'tarmac_core1*.log' -o /work/coverage/core1
+  --elf core1.elf --log-name tarmac_core1.log -o /work/coverage
 ```
+
+두 실행에 **같은 출력 폴더**를 지정할 수 있습니다. `--log-name`을 지정한 경우
+`.log` 또는 `.log.gz`를 제거한 이름으로 merge/보고서를 구분합니다.
+
+| 선택 옵션 | 합산 파일 | 보고서 |
+|---|---|---|
+| `--log-name tarmac_core0.log` | `total_merge_tarmac_core0_cachegrind.out` | `batch_report_tarmac_core0.json` |
+| `--log-name tarmac_core1.log` | `total_merge_tarmac_core1_cachegrind.out` | `batch_report_tarmac_core1.json` |
+| 미지정 (`--pattern`만 사용한 경우 포함) | `total_merge_cachegrind.out` | `batch_report.json` |
+
+같은 코어를 다시 실행하면 그 코어의 개별 파일·합산·보고서만 교체합니다. 기존 결과에
+중복 누적하지 않습니다. `.log`와 그 압축본 `.log.gz`는 같은 출력 이름을 사용하므로
+별도의 결과로 보관하려면 출력 폴더를 분리하세요. 옵션에 적은 파일이 실제로 선택한
+ELF와 대응하는지는 사용자가 확인해야 하며, 파일명만으로 자동 검증할 수 없습니다.
 
 ### 실패 처리
 
@@ -136,7 +152,10 @@ python3 tarmac_to_cachegrind.py /work/test_results \
 나머지를 계속 변환하며, 실패가 하나라도 있으면 종료 코드는 1입니다. 일부만 성공하면
 성공한 로그의 결과로 total을 생성하고 stderr에 **PARTIAL MERGE** 경고를 표시하며
 JSON의 `partial_merge`를 true로 기록합니다. 출력 프로파일에는 `desc:`를 넣지 않습니다.
-모두 실패하면 total은 만들지 않습니다. ELF 분석 실패나 출력 이름 충돌 등 공통 오류는
+모두 실패하면 새로운 total은 만들지 않습니다. 이전 total이 있으면 보존하되 갱신되지
+않았다는 경고를 출력합니다. 실패한 개별 파일의 이전 결과도 보존하고 이번 merge에는
+넣지 않습니다. 이렇게 보존된 파일은 보고서의 `preserved_previous_outputs`에서 확인할
+수 있습니다. `merged_output: null`이면 이번 실행에서 생성한 merge가 없습니다. ELF 분석 실패나 출력 이름 충돌 등 공통 오류는
 변환 시작 전에 중단합니다. 실행 명령어가 0개라도 EXC/IS 같은 인식 가능한 이벤트가
 있으면 기본 coverage 모드에서 0으로 처리하지만, 빈 파일이나 무관한 텍스트는 실패합니다.
 
@@ -368,7 +387,7 @@ gzip -dc core0.log.gz | python3 tarmac_to_cachegrind.py - --elf core0.elf -o cac
 python3 -m unittest discover -s tests -v
 ```
 
-Python 3.6.8 및 3.12.14 인터프리터에서 아래 38개 테스트의 통과를 확인했습니다.
+Python 3.6.8 및 3.12.14 인터프리터에서 아래 42개 테스트의 통과를 확인했습니다.
 `dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,
@@ -380,8 +399,10 @@ Python 3.6.8 및 3.12.14 인터프리터에서 아래 38개 테스트의 통과�
 - addr2line 없는 PATH에서 실제 objdump fallback: 두 trace 형식, offset, CSV,
   미실행 함수, 실행 PC 전용 모드, 미해결 PC 보존 및 명시적 도구 경로 오류.
 - 800개 합성 로그의 일괄 변환/merge 및 ELF 분석 재사용, 재귀 파일명, 패턴 필터,
-  부분 실패 보고, 출력 충돌/기존 결과 보호, merge 전용 모드 및 배치 fallback.
+  부분 실패 보고, 출력 충돌/덮어쓰기, merge 전용 모드 및 배치 fallback.
 - 깊이 0/1/2의 탐색 결과, 제한 아래 폴더를 열지 않는지, 음수 깊이 거부를 검증합니다.
+- 서로 다른 실제 ELF 두 개를 파일명으로 선택해 같은 폴더에 출력, 재실행 시 덮어쓰기,
+  다른 코어 결과 보존, 정확한 파일명 비교 및 실패 시 과거 출력 보고를 검증합니다.
 - 헤더 순서, PC/라인/Ir 열, 미실행 PC, runtime offset, merge 비용 보존을 검증합니다.
   사용자 뷰어 자체의 로딩 검증은 포함하지 않습니다.
 
