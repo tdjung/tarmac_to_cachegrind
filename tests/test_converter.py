@@ -127,7 +127,7 @@ class ProfileTests(unittest.TestCase):
         result = subprocess.CompletedProcess([], 0, "foo()\nC:/src/main.cpp:12 (discriminator 2)\n??\n??:?\n", "")
         with patch.object(converter.subprocess, "run", return_value=result) as run:
             sources = converter.resolve_pcs([0x3000, 0x3002, 0x3000], Path("a.elf"), "addr2line", load_offset=0x2000)
-        self.assertEqual(run.call_args.kwargs["input"], "0x1000\n0x1002\n")
+        self.assertEqual(run.call_args[1]["input"], "0x1000\n0x1002\n")
         self.assertEqual(sources[0x3000], converter.Source("C:/src/main.cpp", "foo()", 12))
         self.assertEqual(sources[0x3002], converter.Source())
 
@@ -153,10 +153,13 @@ class IntegrationTests(unittest.TestCase):
             "int work(int x) { return x + 1; }\n"
             "int main(void) { return work(3); }\n"
         )
-        subprocess.run(["gcc", "-g", "-O0", "-fno-inline", "-no-pie", str(cls.source), "-o", str(cls.elf)], check=True, capture_output=True)
-        nm = subprocess.run(["nm", "-n", str(cls.elf)], check=True, capture_output=True, text=True)
-        cls.pcs = {fields[2]: int(fields[0], 16) for line in nm.stdout.splitlines()
-                   if len(fields := line.split()) == 3 and fields[2] in ("work", "main")}
+        subprocess.run(["gcc", "-g", "-O0", "-fno-inline", "-no-pie", str(cls.source), "-o", str(cls.elf)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        nm = subprocess.run(["nm", "-n", str(cls.elf)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+        cls.pcs = {}
+        for line in nm.stdout.splitlines():
+            fields = line.split()
+            if len(fields) == 3 and fields[2] in ("work", "main"):
+                cls.pcs[fields[2]] = int(fields[0], 16)
 
     @classmethod
     def tearDownClass(cls):
@@ -175,7 +178,7 @@ class IntegrationTests(unittest.TestCase):
             sys.executable, str(ROOT / "tarmac_to_cachegrind.py"), str(trace),
             "--elf", str(self.elf), "--addr2line", shutil.which("addr2line"),
             "-o", str(output), *map(str, extra),
-        ], input=stdin, text=True, capture_output=True)
+        ], input=stdin, universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
     def test_two_dialects_produce_same_real_source_profile(self):
         profiles = []
@@ -200,7 +203,7 @@ class IntegrationTests(unittest.TestCase):
                     rows = list(csv.DictReader(file))
                 self.assertEqual(sum(int(row["Ir"]) for row in rows), 5)
                 if shutil.which("cg_annotate"):
-                    annotated = subprocess.run(["cg_annotate", "--show=Ir", "--sort=Ir", str(output)], capture_output=True, text=True)
+                    annotated = subprocess.run(["cg_annotate", "--show=Ir", "--sort=Ir", str(output)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
                     self.assertEqual(annotated.returncode, 0, annotated.stderr)
                     self.assertIn("PROGRAM TOTALS", annotated.stdout)
         self.assertEqual(profiles[0], profiles[1])
@@ -246,8 +249,8 @@ class IntegrationTests(unittest.TestCase):
 
     def test_symbol_only_elf_keeps_function_and_unknown_line(self):
         elf = self.directory / "no_debug.elf"
-        subprocess.run(["gcc", "-O0", "-no-pie", str(self.source), "-o", str(elf)], check=True, capture_output=True)
-        nm = subprocess.run(["nm", str(elf)], check=True, capture_output=True, text=True)
+        subprocess.run(["gcc", "-O0", "-no-pie", str(self.source), "-o", str(elf)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        nm = subprocess.run(["nm", str(elf)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
         pc = next(int(line.split()[0], 16) for line in nm.stdout.splitlines() if line.endswith(" T work"))
         source = converter.resolve_pcs([pc], elf, shutil.which("addr2line"))[pc]
         self.assertEqual(source.function, "work")

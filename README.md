@@ -13,7 +13,7 @@ Python 표준 라이브러리와 GNU 호환 `addr2line`만 사용합니다.
 
 ## 요구사항
 
-- Python 3.9 이상. `pip install` 불필요.
+- Python 3.6.8 이상. `pip install` 불필요.
 - 해당 ELF를 읽을 수 있는 `addr2line`:
   `arm-none-eabi-addr2line`, `llvm-addr2line`, `addr2line` 순으로 자동 탐색합니다.
   여러 toolchain이 있으면 `--addr2line`으로 직접 지정하세요.
@@ -182,6 +182,9 @@ gzip -dc core0.log.gz | python3 tarmac_to_cachegrind.py - --elf core0.elf -o cac
 ```bash
 python3 -m unittest discover -s tests -v
 ```
+
+Python 3.6.8 및 3.12.14 인터프리터에서 아래 20개 테스트의 통과를 확인했습니다.
+`dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,
   조건 실패, folded 명령어, malformed 입력 처리.

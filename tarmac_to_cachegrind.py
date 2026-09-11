@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """Convert one core's Tarmac trace to a flat, Ir-only Cachegrind profile."""
 
-from __future__ import annotations
-
 import argparse
-from collections import Counter
+from collections import Counter, namedtuple
 from contextlib import contextmanager
 import csv
-from dataclasses import asdict, dataclass, field
 import gzip
 import json
 import os
@@ -17,7 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Iterable, TextIO
+from typing import Counter as CounterType, Dict, Iterable, List, Optional, TextIO, Tuple
 
 
 HEX = r"(?:0[xX])?[0-9a-fA-F]+"
@@ -48,37 +45,39 @@ class ConversionError(Exception):
     """An actionable input, parsing, or symbolization error."""
 
 
-@dataclass
 class Stats:
-    lines: int = 0
-    instructions: int = 0
-    conditional_skipped: int = 0
-    fetch_failed: int = 0
-    exceptions: int = 0
-    ignored: int = 0
-    malformed: int = 0
-    unique_pcs: int = 0
-    unknown_function_instructions: int = 0
-    unknown_source_instructions: int = 0
-    events: dict[str, int] = field(default_factory=dict)
+    def __init__(self):
+        self.lines = 0
+        self.instructions = 0
+        self.conditional_skipped = 0
+        self.fetch_failed = 0
+        self.exceptions = 0
+        self.ignored = 0
+        self.malformed = 0
+        self.unique_pcs = 0
+        self.unknown_function_instructions = 0
+        self.unknown_source_instructions = 0
+        self.events = {}  # type: Dict[str, int]
 
 
-@dataclass(frozen=True)
-class Source:
-    file: str = "???"
-    function: str = "???"
-    line: int = 0
+class Source(namedtuple("SourceBase", "file function line")):
+    """Immutable, hashable source location, without a dataclasses dependency."""
+
+    __slots__ = ()
+
+    def __new__(cls, file="???", function="???", line=0):
+        return super().__new__(cls, file, function, line)
 
 
 def count_pcs(
     lines: Iterable[str], *, input_format: str = "auto", skip_malformed: bool = False
-) -> tuple[Counter[int], Stats]:
+) -> Tuple[CounterType[int], Stats]:
     """Stream the trace; retain only a histogram of unique instruction PCs.
 
     No timestamp-based deduplication: folded and same-cycle instructions count
     independently. ES without CCFAIL is assumed executed (see README limits).
     """
-    counts: Counter[int] = Counter()
+    counts: CounterType[int] = Counter()
     stats = Stats()
     for line_number, line in enumerate(lines, 1):
         stats.lines += 1
@@ -128,7 +127,7 @@ def count_pcs(
     return counts, stats
 
 
-def find_addr2line(explicit: str | None) -> str:
+def find_addr2line(explicit: Optional[str]) -> str:
     candidates = [explicit] if explicit else [
         "arm-none-eabi-addr2line", "llvm-addr2line", "addr2line"
     ]
@@ -145,7 +144,7 @@ def find_addr2line(explicit: str | None) -> str:
 def resolve_pcs(
     pcs: Iterable[int], elf: Path, tool: str, *, load_offset: int = 0,
     batch_size: int = 4096, timeout: float = 120,
-) -> dict[int, Source]:
+) -> Dict[int, Source]:
     """Resolve unique PCs in bounded stdin batches, never one process per hit.
 
     No -i: attribute each PC once using addr2line's single-frame result. This
@@ -154,7 +153,7 @@ def resolve_pcs(
     if batch_size < 1:
         raise ConversionError("batch size must be positive")
     addresses = sorted(set(pcs))
-    sources: dict[int, Source] = {}
+    sources: Dict[int, Source] = {}
     env = dict(os.environ, LC_ALL="C")
     for start in range(0, len(addresses), batch_size):
         batch = addresses[start:start + batch_size]
@@ -165,7 +164,7 @@ def resolve_pcs(
             result = subprocess.run(
                 [tool, "-e", str(elf.resolve()), "-f", "-C"],
                 input="".join(f"0x{pc:x}\n" for pc in queries),
-                text=True, encoding="utf-8", errors="replace",
+                universal_newlines=True, encoding="utf-8", errors="replace",
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 env=env, timeout=timeout, check=False,
             )
@@ -194,8 +193,8 @@ def resolve_pcs(
     return sources
 
 
-def aggregate(counts: Counter[int], sources: dict[int, Source], stats: Stats) -> Counter[Source]:
-    costs: Counter[Source] = Counter()
+def aggregate(counts: CounterType[int], sources: Dict[int, Source], stats: Stats) -> CounterType[Source]:
+    costs: CounterType[Source] = Counter()
     for pc, count in counts.items():
         source = sources[pc]
         costs[source] += count
@@ -210,7 +209,7 @@ def one_line(value: str) -> str:
     return value.replace("\r", " ").replace("\n", " ")
 
 
-def write_cachegrind(out: TextIO, costs: Counter[Source], elf: Path) -> None:
+def write_cachegrind(out: TextIO, costs: CounterType[Source], elf: Path) -> None:
     """Write the Cachegrind subset, without Callgrind-specific headers or edges."""
     out.write("desc: Tarmac flat instruction profile; no cache simulation\n")
     out.write(f"cmd: {one_line(str(elf))}\nevents: Ir\n")
@@ -231,7 +230,7 @@ def atomic_text(path: Path):
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", newline="", dir=path.parent,
+            mode="w", encoding="utf-8", newline="", dir=str(path.parent),
             prefix=f".{path.name}.", delete=False,
         ) as out:
             temporary = Path(out.name)
@@ -239,7 +238,10 @@ def atomic_text(path: Path):
         os.replace(temporary, path)
     finally:
         if temporary is not None:
-            temporary.unlink(missing_ok=True)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def integer(value: str) -> int:
@@ -287,7 +289,7 @@ def validate_paths(args: argparse.Namespace) -> None:
             raise ConversionError(f"invalid output path (parent must exist): {path}")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         validate_paths(args)
@@ -311,7 +313,7 @@ def main(argv: list[str] | None = None) -> int:
                                      source.file, source.function, source.line])
         if args.stats:
             with atomic_text(args.stats) as out:
-                json.dump(asdict(stats), out, indent=2, sort_keys=True)
+                json.dump(vars(stats), out, indent=2, sort_keys=True)
                 out.write("\n")
         with atomic_text(args.output) as out:
             write_cachegrind(out, costs, args.elf)
