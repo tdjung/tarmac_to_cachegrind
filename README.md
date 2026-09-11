@@ -1,7 +1,7 @@
 # Tarmac → Cachegrind
 
 두 가지 Arm Tarmac 로그 형식의 **PC별 명령어 실행 횟수**를 ELF와 결합해
-함수·파일·소스 라인별 **flat Cachegrind 프로파일**로 변환합니다.
+PC·함수·파일·소스 라인별 **flat 프로파일**로 변환합니다.
 
 Python 표준 라이브러리와 대상 코어용 `objdump`를 사용하며, 소스 위치 조회에는
 GNU 호환 `addr2line`을 우선 사용합니다. 자동 탐색으로도 찾지 못하면 objdump의
@@ -27,7 +27,7 @@ GNU 호환 `addr2line`을 우선 사용합니다. 자동 탐색으로도 찾지 
   호스트용 `objdump`가 Arm을 지원하지 않으면 Arm toolchain을 지정하세요.
 - 실행 이미지에 대응하는 ELF. 함수명에는 심볼, 파일/라인에는 DWARF 디버그 정보가
   필요합니다. 실제 사용한 최적화 옵션을 유지하고 `-g`를 포함한 ELF를 사용하세요.
-- 결과 확인용 `cg_annotate`(Valgrind에 포함) 또는 KCachegrind/QCachegrind.
+- 결과 확인용 `positions: instr line`을 지원하는 뷰어.
 
 ## 빠른 시작: 두 코어를 각각 변환
 
@@ -44,8 +44,7 @@ python3 tarmac_to_cachegrind.py core1.log \
   --objdump arm-none-eabi-objdump \
   -o cachegrind.out.core1
 
-cg_annotate --show=Ir --sort=Ir cachegrind.out.core0
-cg_annotate --show=Ir --sort=Ir cachegrind.out.core1
+# 생성한 파일을 PC + 소스 라인 형식을 지원하는 뷰어에서 여세요.
 ```
 
 형식은 기본적으로 자동 인식합니다. 필요하면 `--format es` 또는 `--format it`로
@@ -90,7 +89,7 @@ python3 tarmac_to_cachegrind.py /work/test_results \
 | `group/case03/tarmac_core0.log.gz` | `group_case03_tarmac_core0_cachegrind.out` |
 
 끝에는 **`total_merge_cachegrind.out`**과 **`batch_report.json`**도 생성됩니다.
-merge는 변환 중 메모리에서 동일한 `파일·함수·라인`의 `Ir`을 합산합니다. 개별 출력
+merge는 변환 중 메모리에서 동일한 `PC·파일·함수·라인`의 `Ir`을 합산합니다. 개별 출력
 파일 800개를 다시 읽는 post-merge 단계가 없습니다. 미실행 라인의 0은 유지되며,
 어느 시나리오에서든 실행한 라인은 합계가 양수가 됩니다. `Ir`은 실행 횟수의 합계이지
 그 라인을 실행한 시나리오의 개수가 아닙니다.
@@ -229,19 +228,22 @@ timestamp는 정수이며 생략할 수 있습니다. 단위는 `tic`, `ps`, `ns
 ## 출력 의미
 
 ```text
+# cachegrind format
 desc: Tarmac flat instruction profile; no cache simulation
 cmd: firmware.elf
+positions: instr line
 events: Ir
 fl=src/main.c
 fn=main
-42 300
-43 100
-44 0
+0x202 75 0
+0x204 76 1
+0x206 76 399
 summary: 400
 ```
 
-`42 300`은 소스 42번 라인에 대응하는 명령어들의 실행 횟수 합계가 300이라는
-뜻입니다. **소스 라인 자체가 300번 실행됐다는 뜻은 아닙니다.** 함수의 비용도
+`0x204 76 1`은 PC `0x204`가 소스 76번 라인에 대응하고 한 번 실행됐다는 뜻입니다.
+같은 소스 라인의 다른 PC는 별도 행으로 유지합니다. 출력 PC는 trace의 runtime 주소이며,
+ELF 조회에는 `PC - load_offset`을 사용합니다. 함수의 비용은
 그 함수에 직접 귀속된 명령어 수의 합계이며, 하위 함수의 비용을 더하지 않습니다.
 16비트와 32비트 명령어 모두 실행당 1입니다. 명령어 바이트 수나 cycle 수가 아닙니다.
 
@@ -249,8 +251,8 @@ summary: 400
 
 기본 동작은 `objdump -d -z --no-show-raw-insn`으로 ELF의 실행 가능한 섹션에서
 명령어 시작 주소를 수집하는 것입니다. 각 주소에 0을 설정하고 trace의 횟수를
-합산하므로, 한 번도 호출되지 않은 함수나 실행되지 않은 라인도 `44 0`처럼 출력됩니다.
-같은 라인의 다른 PC가 실행됐다면 해당 라인의 값은 양수가 됩니다. `summary`에는
+합산하므로, 한 번도 호출되지 않은 함수나 실행되지 않은 라인도 `0x202 75 0`처럼 출력됩니다.
+같은 라인의 다른 PC가 실행됐어도 미실행 PC의 값은 0으로 유지됩니다. `summary`에는
 실행된 횟수만 합산되므로 0인 항목이 늘어도 총 실행 수는 변하지 않습니다.
 
 메모리의 모든 바이트 주소를 PC로 취급하지 않습니다. 비실행 데이터 섹션은 제외하며,
@@ -260,14 +262,15 @@ summary: 400
 
 **coverage의 범위는 ELF에 남아 있고 소스 라인으로 매핑 가능한 명령어입니다.**
 최적화/링커에 의해 제거된 코드, 주석, 빈 줄은 0인 실행 가능 라인으로 추가하지 않습니다.
-한 소스 라인에 여러 명령어나 분기가 있으면 일부만 실행돼도 `Ir > 0`이므로,
-이 값은 완전한 branch/condition coverage를 나타내지 않습니다.
+PC별 실행 여부를 확인할 수 있지만, 이 값만으로 완전한 branch/condition coverage를
+나타내지는 않습니다.
 
 CSV에도 미실행 PC를 `Ir=0`으로 포함합니다. JSON의 `unique_pcs`는 trace에서 실제로
 실행된 고유 PC 수이고, `elf_instruction_pcs`는 objdump에서 수집한 고유 명령어 주소
 수입니다. `--load-offset`은 ELF 주소를 runtime 주소로 변환하는 단계에도 적용됩니다.
-뷰어가 0인 항목을 숨기면 표시 필터를 조정하세요. `cg_annotate`에서는
-`--threshold=0 --show=Ir --sort=Ir`로 확인할 수 있습니다.
+뷰어가 0인 항목을 숨기면 표시 필터를 조정하세요. 요청된 출력은 `positions: instr line`을
+사용하므로 기존 line-only Cachegrind 형식과 다릅니다. `cg_annotate`와 같은 line-only
+reader는 지원하지 않을 수 있습니다. 첫 줄은 요청된 `# cachegrind format`을 사용합니다.
 
 기존처럼 실행된 PC만 처리하려면 다음과 같이 실행합니다. addr2line을 사용할 수 있으면
 이 모드에는 objdump가 필요 없고 대형 ELF 전체를 탐색하지 않습니다. addr2line이 없으면
@@ -358,14 +361,14 @@ Python 3.6.8 및 3.12.14 인터프리터에서 아래 36개 테스트의 통과�
   조건 실패, folded 명령어, malformed 입력 처리.
 - 실제 GCC 생성 ELF + `addr2line`: 함수/라인 연결, 두 문법의 출력 일치,
   offset, gzip/stdin, 미해결 주소 및 비용 보존.
-- 미실행 함수의 0 비용, 데이터 제외, 같은 라인의 0/양수 비용 합산, 빈 trace,
+- 미실행 함수의 0 비용, 데이터 제외, 같은 라인의 서로 다른 PC 보존 및 PC별 비용 합산, 빈 trace,
   실행 PC 전용 모드 및 잘못된 objdump 지정 시 기존 출력 보존.
 - addr2line 없는 PATH에서 실제 objdump fallback: 두 trace 형식, offset, CSV,
   미실행 함수, 실행 PC 전용 모드, 미해결 PC 보존 및 명시적 도구 경로 오류.
 - 800개 합성 로그의 일괄 변환/merge 및 ELF 분석 재사용, 재귀 파일명, 패턴 필터,
   부분 실패 보고, 출력 충돌/기존 결과 보호, merge 전용 모드 및 배치 fallback.
-- `cg_annotate`가 설치되어 있으면 생성한 프로파일을 실제 reader로 검증합니다.
-  전체 검증을 위해 GCC/binutils/Valgrind를 설치한 환경에서 테스트를 실행하세요.
+- 헤더 순서, PC/라인/Ir 열, 미실행 PC, runtime offset, merge 비용 보존을 검증합니다.
+  사용자 뷰어 자체의 로딩 검증은 포함하지 않습니다.
 
 ELF 통합 테스트에는 `gcc`, `nm`, `addr2line`, `objdump`가 필요하며 없으면 해당 테스트가
 skip됩니다. 테스트는 호스트에서 컴파일한 ELF 주소에 합성 Tarmac 이벤트를 연결하는

@@ -136,7 +136,8 @@ class ProfileTests(unittest.TestCase):
         source = converter.Source("a.c", "work", 7)
         costs = converter.aggregate(Counter({0x1000: 3, 0x1002: 0}),
                                     {0x1000: source, 0x1002: source}, converter.Stats())
-        self.assertEqual(costs[source], 3)
+        self.assertEqual(costs[converter.Position(0x1000, *source)], 3)
+        self.assertEqual(costs[converter.Position(0x1002, *source)], 0)
 
     def test_costs_aggregate_by_file_function_line_and_preserve_unknowns(self):
         counts = Counter({0x1000: 3, 0x1002: 4, 0x2000: 2, 0x3000: 1})
@@ -148,17 +149,19 @@ class ProfileTests(unittest.TestCase):
         }
         stats = converter.Stats()
         costs = converter.aggregate(counts, sources, stats)
-        self.assertEqual(costs[converter.Source("a.c", "work", 7)], 7)
+        self.assertEqual(costs[converter.Position(0x1000, "a.c", "work", 7)], 3)
+        self.assertEqual(costs[converter.Position(0x1002, "a.c", "work", 7)], 4)
         self.assertEqual(stats.unknown_source_instructions, 1)
         self.assertEqual(stats.unknown_function_instructions, 1)
         out = io.StringIO()
         converter.write_cachegrind(out, costs, Path("firmware.elf"))
         self.assertEqual(out.getvalue(),
+            "# cachegrind format\n"
             "desc: Tarmac flat instruction profile; no cache simulation\n"
-            "cmd: firmware.elf\nevents: Ir\n"
-            "fl=???\nfn=???\n0 1\n"
-            "fl=a.c\nfn=work\n7 7\n"
-            "fl=b.c\nfn=work\n7 2\nsummary: 10\n")
+            "cmd: firmware.elf\npositions: instr line\nevents: Ir\n"
+            "fl=???\nfn=???\n0x3000 0 1\n"
+            "fl=a.c\nfn=work\n0x1000 7 3\n0x1002 7 4\n"
+            "fl=b.c\nfn=work\n0x2000 7 2\nsummary: 10\n")
 
     def test_atomic_writer_keeps_existing_file_on_error(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -243,11 +246,13 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 profile = output.read_text()
                 profiles.append(profile)
-                self.assertIn("fn=work\n1 3\n", profile)
-                self.assertIn("fn=main\n2 2\n", profile)
-                self.assertIn("fn=never_called\n3 0\n", profile)
+                self.assertRegex(profile, r"fn=work\n0x[0-9a-f]+ 1 3\n")
+                self.assertRegex(profile, r"fn=main\n0x[0-9a-f]+ 2 2\n")
+                self.assertRegex(profile, r"fn=never_called\n0x[0-9a-f]+ 3 0\n")
                 self.assertNotIn("fn=data_only", profile)
                 self.assertTrue(profile.endswith("summary: 5\n"))
+                self.assertTrue(profile.startswith("# cachegrind format\n"))
+                self.assertIn("positions: instr line\nevents: Ir\n", profile)
                 values = json.loads(stats.read_text())
                 self.assertEqual(values["instructions"], 5)
                 self.assertEqual(values["unique_pcs"], 2)
@@ -257,10 +262,6 @@ class IntegrationTests(unittest.TestCase):
                     rows = list(csv.DictReader(file))
                 self.assertEqual(sum(int(row["Ir"]) for row in rows), 5)
                 self.assertTrue(any(row["function"] == "never_called" and row["Ir"] == "0" for row in rows))
-                if shutil.which("cg_annotate"):
-                    annotated = subprocess.run(["cg_annotate", "--show=Ir", "--sort=Ir", str(output)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
-                    self.assertEqual(annotated.returncode, 0, annotated.stderr)
-                    self.assertIn("PROGRAM TOTALS", annotated.stdout)
         self.assertEqual(profiles[0], profiles[1])
 
     def fallback_cli(self, output, trace, *extra):
@@ -282,9 +283,9 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("using objdump -l", result.stderr)
                 profile = output.read_text()
-                self.assertIn("fn=work\n1 3\n", profile)
-                self.assertIn("fn=main\n2 2\n", profile)
-                self.assertIn("fn=never_called\n3 0\n", profile)
+                self.assertRegex(profile, r"fn=work\n0x[0-9a-f]+ 1 3\n")
+                self.assertRegex(profile, r"fn=main\n0x[0-9a-f]+ 2 2\n")
+                self.assertRegex(profile, r"fn=never_called\n0x[0-9a-f]+ 3 0\n")
                 self.assertTrue(profile.endswith("summary: 5\n"))
                 with audit.open() as file:
                     rows = list(csv.DictReader(file))
@@ -297,8 +298,8 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         profile = output.read_text()
         self.assertNotIn("never_called", profile)
-        self.assertIn("fn=work\n1 3\n", profile)
-        self.assertIn("fl=???\nfn=???\n0 1\n", profile)
+        self.assertRegex(profile, r"fn=work\n0x[0-9a-f]+ 1 3\n")
+        self.assertIn("fl=???\nfn=???\n0x1 0 1\n", profile)
         self.assertTrue(profile.endswith("summary: 6\n"))
 
     def test_explicit_missing_addr2line_does_not_fallback(self):
@@ -319,14 +320,15 @@ class IntegrationTests(unittest.TestCase):
                 output = self.directory / "relocated.out"
                 result = self.run_cli(name, output, "--load-offset", hex(offset), stdin=stdin)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn("fn=work\n1 3\n", output.read_text())
-                self.assertIn("fn=never_called\n3 0\n", output.read_text())
+                self.assertRegex(output.read_text(), r"fn=work\n0x[0-9a-f]+ 1 3\n")
+                self.assertIn("0x{:x} 1 3\n".format(self.pcs["work"] + offset), output.read_text())
+                self.assertRegex(output.read_text(), r"fn=never_called\n0x[0-9a-f]+ 3 0\n")
 
     def test_unknown_pc_preserves_count_and_warns(self):
         output = self.directory / "unknown.out"
         result = self.run_cli("-", output, stdin="IT 00000000 2000 T16 MOVS r0,#0")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("fl=???\nfn=???\n0 1\n", output.read_text())
+        self.assertIn("fl=???\nfn=???\n0x0 0 1\n", output.read_text())
         self.assertTrue(output.read_text().endswith("summary: 1\n"))
         self.assertIn("warning:", result.stderr)
 
@@ -338,7 +340,7 @@ class IntegrationTests(unittest.TestCase):
         output = self.directory / "empty.out"
         result = self.run_cli("-", output, stdin="")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("fn=never_called\n3 0\n", output.read_text())
+        self.assertRegex(output.read_text(), r"fn=never_called\n0x[0-9a-f]+ 3 0\n")
         self.assertTrue(output.read_text().endswith("summary: 0\n"))
         self.assertIn("no executed instructions", result.stderr)
 
@@ -347,7 +349,7 @@ class IntegrationTests(unittest.TestCase):
         result = self.run_cli("-", output, "--executed-only", "--objdump", "/missing/objdump", stdin=self.trace("es"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("never_called", output.read_text())
-        self.assertIn("fn=work\n1 3\n", output.read_text())
+        self.assertRegex(output.read_text(), r"fn=work\n0x[0-9a-f]+ 1 3\n")
 
     def test_wrong_objdump_does_not_replace_output(self):
         output = self.directory / "bad-objdump.out"

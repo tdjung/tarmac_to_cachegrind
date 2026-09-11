@@ -62,8 +62,11 @@ class BatchTests(unittest.TestCase):
         output = root / "cachegrind-output"
         self.assertEqual(len(list(output.glob("*_cachegrind.out"))), 801)
         merged = (output / "total_merge_cachegrind.out").read_text()
-        self.assertIn("fn=work\n1 800\n", merged)
-        self.assertIn("fn=never_called\n3 0\n", merged)
+        self.assertTrue(merged.startswith("# cachegrind format\n"))
+        self.assertIn("positions: instr line\nevents: Ir\n", merged)
+        self.assertIn("0x{:x} 1 800\n".format(self.pcs["work"]), merged)
+        self.assertRegex(merged, r"fn=work\n0x[0-9a-f]+ 1 800\n")
+        self.assertRegex(merged, r"fn=never_called\n0x[0-9a-f]+ 3 0\n")
         self.assertTrue(merged.endswith("summary: 800\n"))
         report = json.loads((output / "batch_report.json").read_text())
         self.assertEqual(len(report["successful"]), 800)
@@ -83,6 +86,7 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(len(report["failed"]), 1)
         self.assertTrue((output / "nested_deep_tarmac_good_cachegrind.out").exists())
         self.assertIn("PARTIAL MERGE", (output / "total_merge_cachegrind.out").read_text())
+        self.assertTrue((output / "total_merge_cachegrind.out").read_text().startswith("# cachegrind format\n"))
 
     def test_pattern_merge_only_and_existing_output_protection(self):
         root = self.fixture("pattern")
@@ -116,7 +120,7 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("using objdump -l", result.stderr)
         merged = (root / "cachegrind-output" / "total_merge_cachegrind.out").read_text()
-        self.assertIn("fn=work\n1 1\n", merged)
+        self.assertRegex(merged, r"fn=work\n0x[0-9a-f]+ 1 1\n")
 
     def test_copied_single_script_supports_file_and_directory(self):
         root = self.fixture("standalone")
@@ -133,7 +137,7 @@ class BatchTests(unittest.TestCase):
             ], cwd=str(root), universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("complete ", result.stderr)
-        self.assertIn("fn=work\n1 1\n", (root / "single.out").read_text())
+        self.assertRegex((root / "single.out").read_text(), r"fn=work\n0x[0-9a-f]+ 1 1\n")
         self.assertTrue((root / "batch-out" / "total_merge_cachegrind.out").exists())
 
 

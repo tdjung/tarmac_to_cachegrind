@@ -291,11 +291,14 @@ def seed_elf_pcs(counts: CounterType[int], elf: Path, tool: str,
     return seed_pcs(counts, instruction_pcs(disassemble(elf, tool)), load_offset)
 
 
-def aggregate(counts: CounterType[int], sources: Dict[int, Source], stats: Stats) -> CounterType[Source]:
-    costs: CounterType[Source] = Counter()
+Position = namedtuple("Position", "pc file function line")
+
+
+def aggregate(counts: CounterType[int], sources: Dict[int, Source], stats: Stats) -> CounterType[Position]:
+    costs: CounterType[Position] = Counter()
     for pc, count in counts.items():
         source = sources[pc]
-        costs[source] += count
+        costs[Position(pc, *source)] += count
         if source.function == "???":
             stats.unknown_function_instructions += count
         if source.file == "???" or source.line == 0:
@@ -307,18 +310,21 @@ def one_line(value: str) -> str:
     return value.replace("\r", " ").replace("\n", " ")
 
 
-def write_cachegrind(out: TextIO, costs: CounterType[Source], elf: Path) -> None:
-    """Write the Cachegrind subset, without Callgrind-specific headers or edges."""
+def write_cachegrind(out: TextIO, costs: CounterType[Position], elf: Path, description=None) -> None:
+    """Write the requested instruction-address and source-line profile format."""
+    out.write("# cachegrind format\n")
+    if description:
+        out.write("desc: " + one_line(description) + "\n")
     out.write("desc: Tarmac flat instruction profile; no cache simulation\n")
-    out.write(f"cmd: {one_line(str(elf))}\nevents: Ir\n")
+    out.write(f"cmd: {one_line(str(elf))}\npositions: instr line\nevents: Ir\n")
     previous = None
-    for source in sorted(costs, key=lambda s: (s.file, s.function, s.line)):
+    for source in sorted(costs, key=lambda s: (s.file, s.function, s.pc, s.line)):
         key = (source.file, source.function)
         if key != previous:
             # Every fl is immediately followed by fn, as Cachegrind requires.
             out.write(f"fl={one_line(source.file)}\nfn={one_line(source.function)}\n")
             previous = key
-        out.write(f"{source.line} {costs[source]}\n")
+        out.write(f"0x{source.pc:x} {source.line} {costs[source]}\n")
     out.write(f"summary: {sum(costs.values())}\n")
 
 
@@ -375,8 +381,8 @@ class ProfileContext:
                 runtime = Counter()
                 self.elf_pc_count = seed_pcs(runtime, pcs, self.offset)
                 self.resolve(runtime)
-                for source in self.sources.values():
-                    self.baseline[source] = 0
+                for pc, source in self.sources.items():
+                    self.baseline[Position(pc, *source)] = 0
 
     def resolve(self, pcs):
         missing = set(pcs).difference(self.sources)
@@ -474,9 +480,10 @@ def run_batch(args):
     if report["successful"]:
         name = "total_merge_cachegrind.out"
         with atomic_text(output / name) as file:
+            description = None
             if report["failed"]:
-                file.write("desc: PARTIAL MERGE: {} of {} logs failed; see batch_report.json\n".format(len(report["failed"]), len(paths)))
-            write_cachegrind(file, total, args.elf)
+                description = "PARTIAL MERGE: {} of {} logs failed; see batch_report.json".format(len(report["failed"]), len(paths))
+            write_cachegrind(file, total, args.elf, description=description)
         report["merged_output"] = name
         print("complete " + json.dumps(name), file=sys.stderr, flush=True)
     with atomic_text(output / "batch_report.json") as file:
