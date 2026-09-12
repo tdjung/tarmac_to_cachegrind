@@ -62,7 +62,7 @@ python3 tarmac_to_cachegrind.py core1.log \
 변환, 폴더이면 깊이가 제한된 배치 변환으로 자동 선택합니다. 기존 별도 배치 파일은 통합되어
 제거됐으므로 배치 실행 명령도 이 파일명으로 바꿔 주세요. 배치에서는 ELF
 디스어셈블/소스 매핑을 공유합니다. trace에서 새롭게 발견된
-PC만 추가 조회하며, 한 번에 하나의 로그만 읽습니다. 병렬 작업 프로세스를 만들지 않습니다.
+PC만 추가 조회합니다. 기본은 순차 실행이며 `--workers N`으로 파일 단위 병렬 처리를 켭니다.
 
 ```bash
 python3 tarmac_to_cachegrind.py /work/test_results \
@@ -96,7 +96,8 @@ python3 tarmac_to_cachegrind.py /work/test_results \
 최소화하고, 모든 경로에 `resolve()`를 호출하지 않습니다.
 
 끝에는 **`total_merge_cachegrind.out`**과 **`batch_report.json`**도 생성됩니다.
-merge는 변환 중 메모리에서 동일한 `PC·파일·함수·라인`의 `Ir`을 합산합니다. 개별 출력
+merge는 변환 중 메모리에서 동일한 runtime PC의 `Ir`을 합산한 뒤 공유 ELF의
+파일·함수·라인에 연결합니다. 개별 출력
 파일 800개를 다시 읽는 post-merge 단계가 없습니다. 미실행 라인의 0은 유지되며,
 어느 시나리오에서든 실행한 라인은 합계가 양수가 됩니다. `Ir`은 실행 횟수의 합계이지
 그 라인을 실행한 시나리오의 개수가 아닙니다.
@@ -126,10 +127,10 @@ addr2line이 자동 탐색되지 않으면 objdump의 라인 정보를 재사용
 
 ```bash
 python3 tarmac_to_cachegrind.py /work/test_results \
-  --elf core0.elf --log-name tarmac_core0.log -o /work/coverage
+  --elf core0.elf --log-name tarmac_core0.log --workers 4 -o /work/coverage
 
 python3 tarmac_to_cachegrind.py /work/test_results \
-  --elf core1.elf --log-name tarmac_core1.log -o /work/coverage
+  --elf core1.elf --log-name tarmac_core1.log --workers 4 -o /work/coverage
 ```
 
 두 실행에 **같은 출력 폴더**를 지정할 수 있습니다. `--log-name`을 지정한 경우
@@ -145,6 +146,80 @@ python3 tarmac_to_cachegrind.py /work/test_results \
 중복 누적하지 않습니다. `.log`와 그 압축본 `.log.gz`는 같은 출력 이름을 사용하므로
 별도의 결과로 보관하려면 출력 폴더를 분리하세요. 옵션에 적은 파일이 실제로 선택한
 ELF와 대응하는지는 사용자가 확인해야 하며, 파일명만으로 자동 검증할 수 없습니다.
+
+### 속도 개선과 병렬 실행
+
+`--workers 4`는 최대 4개의 **프로세스**가 각각 로그 하나를 파싱하고 개별 출력을
+쓰도록 합니다. Python 3.6의 GIL 때문에 CPU 파싱을 여러 코어에 분산하려면 스레드보다
+프로세스가 적합합니다. 기본값은 1이고, 지정한 수가 로그 수보다 크면 로그 수로 제한합니다.
+두 코어의 변환 명령을 동시에 실행하면 `4 + 4 = 8`개 worker가 사용됩니다.
+우선 4개로 측정한 다음 가용 CPU·메모리·스토리지 처리량에 맞춰 조절하세요.
+
+| 처리 단계 | 기존 | 변경 |
+|---|---|---|
+| 로그 파싱 | 모든 줄의 이벤트 검사, 매 명령어 정규식 해석 및 PC 숫자 변환 | 비이벤트 줄 빠른 제외, 반복 명령어 해석 결과 최대 8,192개 LRU 캐시 |
+| ELF 분석 | 배치 시작에 한 번 분석 | 동일하게 한 번 분석하고 worker에 전달 |
+| 개별 출력 | ELF 전체 0 비용 복사, 위치 키 구성, 매번 정렬·문자열 생성 | 기본 coverage 출력 순서와 PC/라인 문자열을 한 번 준비해 재사용 |
+| total 집계 | 각 파일의 전체 coverage 항목을 0까지 합산 | 성공한 파일의 실행 PC별 횟수만 부모에서 합산 |
+| 파일 처리 | 순차 | `--workers`로 제한한 프로세스 병렬 처리 |
+
+파서 캐시는 timestamp를 제외한 이벤트 종류와 **본문 전체**를 키로 사용합니다.
+같은 PC라도 opcode, CCFAIL, metadata 등이 다르면 별도로 해석하며, 캐시가 적중해도
+각 실행 횟수는 모두 증가합니다. 본문이 매번 달라지는 trace에서는 캐시 효과가 작고
+캐시 관리 비용 때문에 파싱 자체는 오히려 느려질 수도 있습니다.
+로그 전체는 계속 스트리밍하고 캐시는 파일마다 해제합니다.
+
+기본 ELF에 없는 PC가 실행되면 해당 출력에만 추가 위치를 구성합니다. 이 경우의 출력
+정렬 비용은 남습니다. `--executed-only`는 파일마다 실행 PC 집합이 달라 개별 정렬이
+필요합니다. 미실행 PC를 포함하는 기본 동작, PC·라인 구분, 헤더는 유지합니다.
+
+동시성 안전성은 다음과 같이 확보합니다.
+
+- worker마다 독립적인 실행 횟수·소스 조회 캐시를 갖고, 충돌 여부를 사전 검사한
+  서로 다른 출력 파일만 씁니다. 임시 파일 기록 후 atomic replace가 성공해야 완료로 처리합니다.
+- worker는 sparse PC 횟수와 통계만 반환합니다. 부모만 total을 수정하고 마지막에 한 번
+  기록하므로 **명령어마다 공유 카운터를 잠그는 critical section이 없습니다.**
+- 제출했지만 아직 부모가 반영하지 않은 작업은 최대 `2 × workers`개입니다.
+  파일 하나가 늦어도 다른 완료 결과부터 반영하고 새 작업을 공급합니다. 프로세스 간 통신과
+  부모의 집계 비용은 남지만, 원본 로그나 ELF 전체 0 비용을 매 파일마다 전송하지 않습니다.
+- Linux 기본 `fork`에서는 사전 계산한 ELF/출력 레이아웃을 copy-on-write로 공유합니다.
+  `spawn` 환경에서도 initializer로 worker마다 한 번 전달합니다. 추가로 발견한 PC의
+  소스 정보는 worker별로 조회하므로 같은 미등록 PC가 여러 worker에서 조회될 수 있습니다.
+- 진행 표시는 부모가 완료된 순서로 출력하므로 병렬 실행 시 파일명 순서와 다를 수 있습니다.
+  최종 프로파일과 보고서의 성공/실패 목록은 완료 순서에 영향받지 않습니다.
+
+보고서에는 파일별 `seconds.parse/map/write/total`, 실제 worker 수 `workers`,
+부모 집계와 최종 total 생성 시간 `merge_seconds`, 보고서 쓰기 직전까지의 전체 시간
+`elapsed_seconds`가 추가됩니다. 병렬 작업의 파일별 시간을 합치면 전체 경과 시간보다
+클 수 있습니다. 파싱보다 쓰기 시간이 길다면 worker를 늘리기보다는 로컬 SSD 출력이나
+개별 출력이 필요 없는 경우 `--merge-only`를 검토하세요. 기본 coverage 출력 크기 자체는
+줄이지 않으므로 스토리지가 병목이면 CPU 수에 비례한 향상을 기대할 수 없습니다.
+
+재현 가능한 합성 성능 비교(실행용으로 배포할 파일은 여전히 하나):
+
+```bash
+git show 475cadf:tarmac_to_cachegrind.py > /tmp/tarmac_before.py
+python3 tests/benchmark_batch.py --baseline /tmp/tarmac_before.py --workers 4
+```
+
+GCC로 4,000개 함수의 디버그 ELF를 만들고, ES/IT 로그 총 12개에 각각 실행 명령어
+20만 개와 레지스터/메모리 기록을 넣습니다(총 720만 줄). 기존 순차·개선 순차·개선 병렬의
+전체 변환 시간을 측정하고 **개별 12개 + total 1개 출력의 SHA-256 일치**를 검증합니다.
+준비 데이터와 결과는 종료 후 제거됩니다. 도구 실행·파싱·coverage 출력·merge를 포함하며
+로그 생성 시간은 제외합니다. 캐시와 장비 부하에 영향받는 합성 측정이며 실제 Arm 로그의
+수분~십수분 완료를 보장하지 않습니다.
+
+이번 개발 환경에서 위 기본 인자로 측정한 1회 결과입니다.
+
+| 인터프리터 | 기존 순차 | 개선 순차 | 개선 4 workers | 기존 대비 병렬 향상 |
+|---|---:|---:|---:|---:|
+| Python 3.6.8 | 72.79초 | 30.82초 | 10.67초 | 6.82배 |
+| Python 3.12.14 | 18.47초 | 7.90초 | 5.22초 | 3.54배 |
+
+3.6.8은 호환성 확인용으로 `CFLAGS=-O0`로 빌드한 인터프리터입니다. 위 표는 같은
+인터프리터 내 알고리즘/worker 비교용이며, Python 버전 간 속도 비교나 사용자 장비의
+절대 시간 예측에는 사용할 수 없습니다. 실제 로그에서는 우선 일부 폴더를 대상으로
+`--workers 1`, `4`, `8`의 보고서 경과 시간을 비교하세요.
 
 ### 실패 처리
 
@@ -387,7 +462,7 @@ gzip -dc core0.log.gz | python3 tarmac_to_cachegrind.py - --elf core0.elf -o cac
 python3 -m unittest discover -s tests -v
 ```
 
-Python 3.6.8 및 3.12.14 인터프리터에서 아래 42개 테스트의 통과를 확인했습니다.
+Python 3.6.8 및 3.12.14 인터프리터에서 아래 46개 테스트의 통과를 확인했습니다.
 `dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,
@@ -405,6 +480,9 @@ Python 3.6.8 및 3.12.14 인터프리터에서 아래 42개 테스트의 통과�
   다른 코어 결과 보존, 정확한 파일명 비교 및 실패 시 과거 출력 보고를 검증합니다.
 - 헤더 순서, PC/라인/Ir 열, 미실행 PC, runtime offset, merge 비용 보존을 검증합니다.
   사용자 뷰어 자체의 로딩 검증은 포함하지 않습니다.
+- 실제 worker 프로세스에서 순차/병렬 출력 일치, gzip·미등록 PC·부분 실패·이전 출력
+  보존·0 비용, spawn 모드의 merge-only/executed-only 및 잘못된 worker 수를 검증합니다.
+- 반복 해석 캐시가 CCFAIL·fetch 실패·IS/IF·malformed 및 실행 횟수를 보존하는지 검증합니다.
 
 ELF 통합 테스트에는 `gcc`, `nm`, `addr2line`, `objdump`가 필요하며 없으면 해당 테스트가
 skip됩니다. 테스트는 호스트에서 컴파일한 ELF 주소에 합성 Tarmac 이벤트를 연결하는

@@ -7,9 +7,12 @@ from contextlib import contextmanager
 import csv
 import gzip
 import fnmatch
+from functools import lru_cache
 import json
+import multiprocessing
 import os
 from pathlib import Path
+import queue
 import re
 import shutil
 import subprocess
@@ -41,6 +44,24 @@ IT_PAREN_PC = re.compile(
     rf"(?P<opcode>{ENCODING})\s+{STATE}\b(?P<tail>.*)$"
 )
 LOCATION = re.compile(r"^(.*):(\d+|\?)(?:\s+\(discriminator \d+\))?$")
+EXCEPTION = re.compile(r"EXC\b")
+CCFAIL = re.compile(r"\bCCFAIL\b")
+
+
+def decode_instruction(event, body):
+    """Return (PC, disposition); caching includes the entire body, including flags."""
+    if event == "ES" and EXCEPTION.match(body):
+        return None, "exceptions"
+    if event == "IS":
+        return None, "conditional_skipped"
+    match = ES.match(body) if event == "ES" else (IT.match(body) or IT_PAREN_PC.match(body))
+    if match is None:
+        return None, "malformed"
+    if event == "ES" and CCFAIL.search(match.group("tail")):
+        return None, "conditional_skipped"
+    if match.group("opcode")[0] in "-.":
+        return None, "fetch_failed"
+    return int(match.group("pc"), 16), None
 
 
 class ConversionError(Exception):
@@ -83,9 +104,18 @@ def count_pcs(
     """
     counts: CounterType[int] = Counter()
     stats = Stats()
+    # Bounded and local to this trace: no timestamp keys, unbounded trace storage,
+    # or cross-thread mutation. Cache hits still count every occurrence.
+    decode = lru_cache(maxsize=8192)(decode_instruction)
+    event_matcher = EVENT.match
     for line_number, line in enumerate(lines, 1):
         stats.lines += 1
-        event_match = EVENT.match(line)
+        # Most register/memory records cannot possibly match EVENT. This filter
+        # only rejects lines with none of its four literal event tokens.
+        if "ES" not in line and "IT" not in line and "IF" not in line and "IS" not in line:
+            stats.ignored += 1
+            continue
+        event_match = event_matcher(line)
         if not event_match:
             stats.ignored += 1
             continue
@@ -97,29 +127,18 @@ def count_pcs(
                 f"line {line_number}: found {event} in --format {input_format}; "
                 "use --format auto or the correct input file"
             )
-        if event == "ES" and re.match(r"EXC\b", body):
-            stats.exceptions += 1
-            continue
-        if event == "IS":
-            stats.conditional_skipped += 1
-            continue
-        match = ES.match(body) if event == "ES" else (IT.match(body) or IT_PAREN_PC.match(body))
-        if match is None:
-            stats.malformed += 1
+        pc, disposition = decode(event, body)
+        if disposition:
+            setattr(stats, disposition, getattr(stats, disposition) + 1)
+        if disposition == "malformed":
             if not skip_malformed:
                 raise ConversionError(
                     f"line {line_number}: malformed/unsupported {event} instruction; "
                     "check the trace dialect, or use --skip-malformed to omit it"
                 )
             continue
-        if event == "ES" and re.search(r"\bCCFAIL\b", match.group("tail")):
-            stats.conditional_skipped += 1
+        if disposition:
             continue
-        opcode = match.group("opcode")
-        if opcode[0] in "-.":
-            stats.fetch_failed += 1
-            continue
-        pc = int(match.group("pc"), 16)
         counts[pc] += 1
         stats.instructions += 1
     stats.unique_pcs = len(counts)
@@ -360,6 +379,13 @@ def nonnegative_integer(value):
     return number
 
 
+def positive_integer(value):
+    number = integer(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("workers must be positive")
+    return number
+
+
 def log_basename(value):
     if not value or value in (".", "..") or "/" in value or "\\" in value:
         raise argparse.ArgumentTypeError("--log-name requires a filename, not a path")
@@ -394,6 +420,45 @@ class ProfileContext:
                 self.resolve(runtime)
                 for pc, source in self.sources.items():
                     self.baseline[Position(pc, *source)] = 0
+        self.layout = self.make_layout(self.baseline)
+        self.baseline_pcs = {position.pc for position in self.baseline}
+
+    @staticmethod
+    def make_layout(positions):
+        rows = []
+        previous = None
+        for source in sorted(positions, key=lambda s: (s.file, s.function, s.pc, s.line)):
+            key = (source.file, source.function)
+            header = ""
+            if key != previous:
+                header = "fl={}\nfn={}\n".format(one_line(source.file), one_line(source.function))
+                previous = key
+            prefix = header + "0x{:x} {} ".format(source.pc, source.line)
+            rows.append((source.pc, prefix, prefix + "0\n"))
+        return rows
+
+    def prepare(self, counts, stats):
+        self.resolve(counts)
+        stats.elf_instruction_pcs = self.elf_pc_count
+        for pc, count in counts.items():
+            source = self.sources[pc]
+            if source.function == "???":
+                stats.unknown_function_instructions += count
+            if source.file == "???" or source.line == 0:
+                stats.unknown_source_instructions += count
+
+    def write(self, out, counts):
+        # Reuse sorted, preformatted zero-coverage rows. Only an observed PC
+        # outside the baseline requires a per-output extended layout.
+        extras = [Position(pc, *self.sources[pc]) for pc in counts
+                  if pc not in self.baseline_pcs]
+        layout = self.make_layout(list(self.baseline) + extras) if extras else self.layout
+        out.write("# callgrind format\npositions: instr line\nevents: Ir\n")
+        out.write("ob: " + json.dumps(str(self.elf), ensure_ascii=False) + "\n")
+        get = counts.get
+        out.writelines(prefix + str(get(pc)) + "\n" if get(pc, 0) else zero
+                       for pc, prefix, zero in layout)
+        out.write("summary: {}\n".format(sum(counts.values())))
 
     def resolve(self, pcs):
         missing = set(pcs).difference(self.sources)
@@ -405,14 +470,6 @@ class ProfileContext:
         else:
             self.sources.update({pc: self.fallback.get(pc - self.offset, Source())
                                  for pc in missing})
-
-    def costs(self, counts, stats):
-        self.resolve(counts)
-        stats.elf_instruction_pcs = self.elf_pc_count
-        costs = self.baseline.copy()
-        # Counter.update preserves zero entries, unlike Counter addition.
-        costs.update(aggregate(counts, self.sources, stats))
-        return costs
 
 
 def discover(root, patterns, output_dir, max_depth=1, log_name=None):
@@ -450,7 +507,77 @@ def output_name(path, root):
     return "_".join(folders + (name, "cachegrind.out"))
 
 
+_WORKER_CONTEXT = None
+_WORKER_ARGS = None
+
+
+def init_worker(context, args):
+    global _WORKER_CONTEXT, _WORKER_ARGS
+    _WORKER_CONTEXT, _WORKER_ARGS = context, args
+
+
+def convert_batch_file(task, context=None, args=None):
+    """Workers own their counters, symbol caches and distinct atomic outputs."""
+    context = context if context is not None else _WORKER_CONTEXT
+    args = args if args is not None else _WORKER_ARGS
+    path, destination = task
+    started = time.monotonic()
+    try:
+        opener = gzip.open if path.name.endswith(".gz") else open
+        with opener(str(path), "rt", encoding="utf-8-sig", errors="strict") as trace:
+            counts, stats = count_pcs(trace, input_format=args.input_format,
+                                      allow_empty=not args.executed_only)
+        parsed = time.monotonic()
+        if not stats.events:
+            raise ConversionError("no Tarmac instruction/exception records; empty or unrelated log")
+        context.prepare(counts, stats)
+        mapped = time.monotonic()
+        if not args.merge_only:
+            with atomic_text(destination) as file:
+                context.write(file, counts)
+        finished = time.monotonic()
+        # Transfer only executed PCs, never the ELF-wide zero baseline or log.
+        return (path, destination.name, counts, vars(stats),
+                {"parse": parsed - started, "map": mapped - parsed,
+                 "write": finished - mapped, "total": finished - started}, None)
+    except (ConversionError, OSError, UnicodeError, EOFError) as exc:
+        return path, destination.name, None, None, None, str(exc)
+
+
+def batch_results(tasks, context, args, workers):
+    if workers == 1:
+        for task in tasks:
+            yield convert_batch_file(task, context, args)
+        return
+    # Pool.initializer works on Python 3.6 (Executor.initializer does not).
+    # Linux fork shares the precomputed ELF/layout through copy-on-write;
+    # spawn also works by serializing context once per worker, not per log.
+    with multiprocessing.Pool(workers, initializer=init_worker,
+                              initargs=(context, args)) as pool:
+        # Bound queued tasks AND completed sparse histograms to 2*workers.
+        # No per-line shared counter, lock, Manager, or worker-side merge.
+        ready = queue.Queue()
+        pending = iter(tasks)
+
+        def submit(task):
+            pool.apply_async(convert_batch_file, (task,),
+                             callback=lambda result: ready.put((True, result)),
+                             error_callback=lambda error: ready.put((False, error)))
+
+        for _ in range(min(2 * workers, len(tasks))):
+            submit(next(pending))
+        for _ in range(len(tasks)):
+            ok, result = ready.get()
+            if not ok:
+                raise ConversionError("worker failed: {}".format(result))
+            yield result
+            task = next(pending, None)
+            if task is not None:
+                submit(task)
+
+
 def run_batch(args):
+    batch_started = time.monotonic()
     root = Path(args.trace).resolve()
     output = (args.output_dir or args.output or root / "cachegrind-output").resolve()
     if not root.is_dir():
@@ -476,7 +603,9 @@ def run_batch(args):
     context = ProfileContext(args)
     print("ELF analysis complete in {:.2f}s".format(time.monotonic() - started), file=sys.stderr, flush=True)
     output.mkdir(parents=True, exist_ok=True)
-    total = context.baseline.copy()
+    total = Counter()
+    workers = min(args.workers, len(paths))
+    print("Converting with {} worker process(es)...".format(workers), file=sys.stderr, flush=True)
     tag = ""
     if args.log_name:
         tag = args.log_name
@@ -490,37 +619,35 @@ def run_batch(args):
     report = {"elf": str(args.elf.resolve()), "root": str(root), "matched": len(paths),
               "successful": [], "failed": [], "total_instructions": 0,
               "merged_output": None, "max_depth": args.max_depth, "partial_merge": False,
-              "log_name": args.log_name, "preserved_previous_outputs": []}
-    for index, (path, name) in enumerate(zip(paths, names), 1):
-        try:
-            opener = gzip.open if path.name.endswith(".gz") else open
-            with opener(str(path), "rt", encoding="utf-8-sig", errors="strict") as trace:
-                counts, stats = count_pcs(trace, input_format=args.input_format,
-                                                   allow_empty=not args.executed_only)
-            if not stats.events:
-                raise ConversionError("no Tarmac instruction/exception records; empty or unrelated log")
-            costs = context.costs(counts, stats)
-            if not args.merge_only:
-                with atomic_text(output / name) as file:
-                    write_cachegrind(file, costs, args.elf)
-            total.update(costs)
-            report["total_instructions"] += stats.instructions
+              "log_name": args.log_name, "preserved_previous_outputs": [],
+              "workers": workers, "merge_seconds": 0.0}
+    tasks = [(path, output / name) for path, name in zip(paths, names)]
+    for index, result in enumerate(batch_results(tasks, context, args, workers), 1):
+        path, name, counts, stats, timings, error = result
+        if error is None:
+            merge_started = time.monotonic()
+            total.update(counts)
+            report["merge_seconds"] += time.monotonic() - merge_started
+            report["total_instructions"] += stats["instructions"]
             report["successful"].append({"input": str(path.relative_to(root)),
                                          "output": None if args.merge_only else name,
-                                         "stats": vars(stats)})
+                                         "stats": stats, "seconds": timings})
             action = "processed" if args.merge_only else "complete"
             label = str(path.relative_to(root)) if args.merge_only else name
             print("[{}/{}] {} {}".format(index, len(paths), action, json.dumps(label, ensure_ascii=False)), file=sys.stderr, flush=True)
-        except (ConversionError, OSError, UnicodeError, EOFError) as exc:
-            report["failed"].append({"input": str(path.relative_to(root)), "error": str(exc)})
+        else:
+            report["failed"].append({"input": str(path.relative_to(root)), "error": error})
             if not args.merge_only and (output / name).exists():
                 report["preserved_previous_outputs"].append(name)
                 print("warning: previous output preserved, excluded from this merge: " + name, file=sys.stderr, flush=True)
-            print("[{}/{}] FAILED {}: {}".format(index, len(paths), path.relative_to(root), exc), file=sys.stderr, flush=True)
+            print("[{}/{}] FAILED {}: {}".format(index, len(paths), path.relative_to(root), error), file=sys.stderr, flush=True)
     if report["successful"]:
         name = merge_name
+        merge_started = time.monotonic()
+        context.resolve(total)
         with atomic_text(output / name) as file:
-            write_cachegrind(file, total, args.elf)
+            context.write(file, total)
+        report["merge_seconds"] += time.monotonic() - merge_started
         if report["failed"]:
             report["partial_merge"] = True
             print("warning: PARTIAL MERGE: {} logs failed; see {}".format(len(report["failed"]), report_name), file=sys.stderr, flush=True)
@@ -529,12 +656,17 @@ def run_batch(args):
     if not report["successful"] and (output / merge_name).exists():
         report["preserved_previous_outputs"].append(merge_name)
         print("warning: all logs failed; previous merge was not updated: " + merge_name, file=sys.stderr, flush=True)
+    report["successful"].sort(key=lambda item: item["input"])
+    report["failed"].sort(key=lambda item: item["input"])
+    report["preserved_previous_outputs"].sort()
+    report["elapsed_seconds"] = time.monotonic() - batch_started
     with atomic_text(output / report_name) as file:
         json.dump(report, file, indent=2, sort_keys=True)
         file.write("\n")
     print("complete " + json.dumps(report_name), file=sys.stderr, flush=True)
-    print("Completed: {} succeeded, {} failed; {:,} instructions; {}".format(
-        len(report["successful"]), len(report["failed"]), report["total_instructions"], output), file=sys.stderr, flush=True)
+    print("Completed: {} succeeded, {} failed; {:,} instructions; {:.2f}s elapsed; {}".format(
+        len(report["successful"]), len(report["failed"]), report["total_instructions"],
+        time.monotonic() - batch_started, output), file=sys.stderr, flush=True)
     return 1 if report["failed"] else 0
 
 
@@ -551,6 +683,8 @@ def build_parser() -> argparse.ArgumentParser:
     selection.add_argument("--pattern", action="append", help="batch basename glob, repeatable; default: tarmac*.log and tarmac*.log.gz")
     parser.add_argument("--max-depth", type=nonnegative_integer, default=1, help="batch directory depth: 0=root only, 1=root and immediate children (default)")
     parser.add_argument("--merge-only", action="store_true", help="batch: write only merged profile and report")
+    parser.add_argument("--workers", type=positive_integer, default=1,
+                        help="batch: parallel worker processes (default: 1; bounded to matching log count)")
     parser.add_argument("--format", choices=("auto", "es", "it"), default="auto", dest="input_format")
     parser.add_argument("--addr2line", help="GNU-compatible addr2line (auto-detect by default; use objdump -l if none found)")
     parser.add_argument("--objdump", help="target-compatible objdump for ELF instruction enumeration")
@@ -593,8 +727,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             if args.pc_counts or args.stats or args.skip_malformed:
                 raise ConversionError("--pc-counts, --stats and --skip-malformed are single-log options; batch writes batch_report.json")
             return run_batch(args)
-        if args.pattern or args.log_name or args.merge_only:
-            raise ConversionError("--pattern, --log-name and --merge-only require a folder input")
+        if args.pattern or args.log_name or args.merge_only or args.workers != 1:
+            raise ConversionError("--pattern, --log-name, --merge-only and --workers require a folder input")
         if args.output is None:
             raise ConversionError("single-log conversion requires -o/--output")
         validate_paths(args)

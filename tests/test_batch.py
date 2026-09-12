@@ -1,4 +1,5 @@
 import io
+import gzip
 import json
 import os
 from pathlib import Path
@@ -42,6 +43,67 @@ class BatchTests(unittest.TestCase):
     def args(self, root, *extra):
         return [str(root), "--elf", str(self.elf), "--addr2line", shutil.which("addr2line"),
                 "--objdump", shutil.which("objdump")] + list(extra)
+
+    def test_parallel_matches_serial_with_gzip_unknown_pc_and_failures(self):
+        root = self.fixture("parallel")
+        for index in range(9):
+            path = root / "case{}".format(index) / "tarmac.log"
+            self.log(path, "es" if index % 2 else "it")
+            path.write_text((path.read_text() + "\n") * (index + 1))
+        unknown = root / "tarmac_unknown.log.gz"
+        with gzip.open(str(unknown), "wt") as file:
+            file.write("IT fffffffe 2000 T16 MOVS r0,#0\n" * 3)
+        (root / "tarmac_bad.log").write_text("ES malformed")
+        (root / "tarmac_zero.log").write_text("ES EXC [1] Reset\n")
+        outputs = [self.directory / "serial-output", self.directory / "parallel-output"]
+        for workers, output in zip((1, 3), outputs):
+            output.mkdir()
+            old_name = "parallel_tarmac_bad_cachegrind.out"
+            (output / old_name).write_text("previous failed output")
+            result = subprocess.run([sys.executable, str(ROOT / "tarmac_to_cachegrind.py")] +
+                                    self.args(root, "--workers", str(workers), "-o", str(output)),
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("[12/12]", result.stderr)
+            self.assertEqual((output / old_name).read_text(), "previous failed output")
+        for path in outputs[0].glob("*.out"):
+            self.assertEqual(path.read_bytes(), (outputs[1] / path.name).read_bytes(), path.name)
+        reports = [json.loads((output / "batch_report.json").read_text()) for output in outputs]
+        for report in reports:
+            self.assertEqual(report["total_instructions"], 48)
+            self.assertEqual(len(report["failed"]), 1)
+            self.assertTrue(report["partial_merge"])
+            self.assertGreaterEqual(report["merge_seconds"], 0)
+            for entry in report["successful"]:
+                self.assertGreaterEqual(entry.pop("seconds")["parse"], 0)
+        self.assertEqual(reports[0]["successful"], reports[1]["successful"])
+
+    def test_parallel_merge_only_executed_only_and_spawn(self):
+        root = self.fixture("spawn")
+        for index in range(5):
+            self.log(root / str(index) / "tarmac_core0.log", "it")
+        # Exercise initializer/pickling even on Linux, with a real standalone CLI.
+        runner = self.directory / "spawn_runner.py"
+        runner.write_text("import multiprocessing, sys\nsys.path.insert(0, {!r})\n"
+                          "import tarmac_to_cachegrind as m\n"
+                          "if __name__ == '__main__':\n"
+                          "    multiprocessing.set_start_method('spawn')\n"
+                          "    sys.exit(m.main())\n".format(str(ROOT)))
+        result = subprocess.run([sys.executable, str(runner)] + self.args(
+            root, "--workers", "2", "--merge-only", "--executed-only",
+            "--log-name", "tarmac_core0.log"), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, universal_newlines=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = root / "cachegrind-output"
+        self.assertEqual(len(list(output.iterdir())), 2)
+        merged = (output / "total_merge_tarmac_core0_cachegrind.out").read_text()
+        self.assertTrue(merged.endswith("summary: 5\n"))
+        self.assertNotIn("fn=never_called", merged)
+
+    def test_invalid_workers_rejected(self):
+        for workers in ("0", "-1"):
+            with patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+                batch.build_parser().parse_args(["logs", "--elf", "test.elf", "--workers", workers])
 
     def test_800_logs_share_elf_analysis_and_merge_counts(self):
         root = self.fixture("large")

@@ -22,6 +22,26 @@ FIXTURES = ROOT / "tests" / "fixtures"
 
 
 class ParserTests(unittest.TestCase):
+    def test_cached_decode_preserves_flags_events_and_occurrences(self):
+        lines = [
+            "ES (1000:2000) T MOVS r0,#0",
+            "ES (1000:2000) T MOVS r0,#0 CCFAIL",
+            "ES (1000:....) T MOVS r0,#0",
+            "IT (0000:1) 1000 2000 T16 MOVS r0,#0",
+            "IF (0000:2) 1000 2000 T16 MOVS r0,#0",
+            "IS (0000:3) 1000 2000 T16 MOVS r0,#0",
+            "ES EXC [1] Reset", "IT malformed", "R R0 00000000",
+        ] * 20
+        counts, stats = converter.count_pcs(lines, skip_malformed=True)
+        self.assertEqual(counts, {0x1000: 60})
+        self.assertEqual(stats.instructions, 60)
+        self.assertEqual(stats.conditional_skipped, 40)
+        self.assertEqual(stats.fetch_failed, 20)
+        self.assertEqual(stats.exceptions, 20)
+        self.assertEqual(stats.malformed, 20)
+        self.assertEqual(stats.ignored, 20)
+        self.assertEqual(stats.events, {"ES": 80, "IT": 40, "IF": 20, "IS": 20})
+
     def test_es_user_dialect_and_exclusions(self):
         with (FIXTURES / "es.log").open() as trace:
             counts, stats = converter.count_pcs(trace)
