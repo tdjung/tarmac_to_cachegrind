@@ -629,7 +629,14 @@ def convert_batch_file(task, context=None, args=None):
         return path, destination.name, None, None, None, str(exc)
 
 
+def progress(message, args):
+    stream = sys.stdout if args.progress_stream == "stdout" else sys.stderr
+    print(message, file=stream, flush=True)
+
+
 def batch_results(tasks, context, args, workers):
+    started = time.monotonic()
+    progress("[0/{}] starting with {} worker process(es)".format(len(tasks), workers), args)
     if workers == 1:
         for task in tasks:
             yield convert_batch_file(task, context, args)
@@ -651,8 +658,14 @@ def batch_results(tasks, context, args, workers):
 
         for _ in range(min(2 * workers, len(tasks))):
             submit(next(pending))
-        for _ in range(len(tasks)):
-            ok, result = ready.get()
+        for completed in range(len(tasks)):
+            while True:
+                try:
+                    ok, result = ready.get(timeout=5.0)
+                    break
+                except queue.Empty:
+                    progress("[{}/{}] waiting for workers; {:.1f}s elapsed".format(
+                        completed, len(tasks), time.monotonic() - started), args)
             if not ok:
                 raise ConversionError("worker failed: {}".format(result))
             yield result
@@ -674,23 +687,23 @@ def run_batch(args):
     with args.elf.open("rb") as file:
         if file.read(4) != b"\x7fELF":
             raise ConversionError("--elf must point to an ELF file")
-    print("Searching {} (max-depth={})...".format(root, args.max_depth), file=sys.stderr, flush=True)
+    progress("Searching {} (max-depth={})...".format(root, args.max_depth), args)
     started = time.monotonic()
     paths = discover(root, args.pattern or ["tarmac*.log", "tarmac*.log.gz"], output, args.max_depth, args.log_name)
-    print("Search complete: {} logs in {:.2f}s".format(len(paths), time.monotonic() - started), file=sys.stderr, flush=True)
+    progress("Search complete: {} logs in {:.2f}s".format(len(paths), time.monotonic() - started), args)
     if not paths:
         raise ConversionError("no matching logs found")
     indices = {path: i for i, path in enumerate(paths, 1)}
     names = [output_name(path, indices[path]) for path in paths]
-    print("Found {} logs; analyzing ELF...".format(len(paths)), file=sys.stderr, flush=True)
+    progress("Found {} logs; analyzing ELF...".format(len(paths)), args)
     started = time.monotonic()
     context = ProfileContext(args)
-    print("ELF analysis complete in {:.2f}s".format(time.monotonic() - started), file=sys.stderr, flush=True)
+    progress("ELF analysis complete in {:.2f}s".format(time.monotonic() - started), args)
     output.mkdir(parents=True, exist_ok=True)
     total = Counter()
     coverage = CoverageIndex()
     workers = min(args.workers, len(paths))
-    print("Converting with {} worker process(es)...".format(workers), file=sys.stderr, flush=True)
+    progress("Converting with {} worker process(es)...".format(workers), args)
     tag = ""
     if args.log_name:
         tag = args.log_name
@@ -730,15 +743,16 @@ def run_batch(args):
                                          "stats": stats, "seconds": timings})
             action = "processed" if args.merge_only else "complete"
             label = str(path.relative_to(root)) if args.merge_only else name
-            print("[{}/{}] {} {}".format(index, len(paths), action, json.dumps(label, ensure_ascii=False)), file=sys.stderr, flush=True)
+            progress("[{}/{}] {} {}".format(index, len(paths), action, json.dumps(label, ensure_ascii=False)), args)
         else:
             entry.update(status="failed", error=error)
             report["failed"].append({"input": str(path.relative_to(root)), "index": test_index, "error": error})
             if not args.merge_only and (output / name).exists():
                 report["preserved_previous_outputs"].append(name)
                 print("warning: previous output preserved, excluded from this merge: " + name, file=sys.stderr, flush=True)
-            print("[{}/{}] FAILED {}: {}".format(index, len(paths), path.relative_to(root), error), file=sys.stderr, flush=True)
+            progress("[{}/{}] FAILED {}: {}".format(index, len(paths), path.relative_to(root), error), args)
     if report["successful"]:
+        progress("[{}/{}] generating merged profile and coverage index...".format(len(paths), len(paths)), args)
         name = merge_name
         merge_started = time.monotonic()
         context.resolve(total)
@@ -756,13 +770,13 @@ def run_batch(args):
                 index_file.write("\n")
         report["coverage_seconds"] += time.monotonic() - coverage_started
         report["coverage_index"] = index_name
-        print("complete " + json.dumps(index_name), file=sys.stderr, flush=True)
+        progress("complete " + json.dumps(index_name), args)
         report["merge_seconds"] += time.monotonic() - merge_started
         if report["failed"]:
             report["partial_merge"] = True
             print("warning: PARTIAL MERGE: {} logs failed; see {}".format(len(report["failed"]), report_name), file=sys.stderr, flush=True)
         report["merged_output"] = name
-        print("complete " + json.dumps(name), file=sys.stderr, flush=True)
+        progress("complete " + json.dumps(name), args)
     if not report["successful"] and (output / merge_name).exists():
         report["preserved_previous_outputs"].append(merge_name)
         print("warning: all logs failed; previous merge was not updated: " + merge_name, file=sys.stderr, flush=True)
@@ -775,10 +789,10 @@ def run_batch(args):
     with atomic_text(output / report_name) as file:
         json.dump(report, file, indent=2, sort_keys=True)
         file.write("\n")
-    print("complete " + json.dumps(report_name), file=sys.stderr, flush=True)
-    print("Completed: {} succeeded, {} failed; {:,} instructions; {:.2f}s elapsed; {}".format(
+    progress("complete " + json.dumps(report_name), args)
+    progress("Completed: {} succeeded, {} failed; {:,} instructions; {:.2f}s elapsed; {}".format(
         len(report["successful"]), len(report["failed"]), report["total_instructions"],
-        time.monotonic() - batch_started, output), file=sys.stderr, flush=True)
+        time.monotonic() - batch_started, output), args)
     return 1 if report["failed"] else 0
 
 
@@ -797,6 +811,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--merge-only", action="store_true", help="batch: write only merged profile and report")
     parser.add_argument("--workers", type=positive_integer, default=1,
                         help="batch: parallel worker processes (default: 1; bounded to matching log count)")
+    parser.add_argument("--progress-stream", choices=("stderr", "stdout"), default="stderr",
+                        help="batch: progress output stream (default: stderr; use stdout for captured job output)")
     parser.add_argument("--format", choices=("auto", "es", "it"), default="auto", dest="input_format")
     parser.add_argument("--addr2line", help="GNU-compatible addr2line (auto-detect by default; use objdump -l if none found)")
     parser.add_argument("--objdump", help="target-compatible objdump for ELF instruction enumeration")
@@ -839,8 +855,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             if args.pc_counts or args.stats or args.skip_malformed:
                 raise ConversionError("--pc-counts, --stats and --skip-malformed are single-log options; batch writes batch_report.json")
             return run_batch(args)
-        if args.pattern or args.log_name or args.merge_only or args.workers != 1:
-            raise ConversionError("--pattern, --log-name, --merge-only and --workers require a folder input")
+        if args.pattern or args.log_name or args.merge_only or args.workers != 1 or args.progress_stream != "stderr":
+            raise ConversionError("--pattern, --log-name, --merge-only, --workers and --progress-stream require a folder input")
         if args.output is None:
             raise ConversionError("single-log conversion requires -o/--output")
         validate_paths(args)

@@ -120,6 +120,40 @@ class BatchTests(unittest.TestCase):
             with patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
                 batch.build_parser().parse_args(["logs", "--elf", "test.elf", "--workers", workers])
 
+    def test_parallel_progress_stdout_and_merge_only(self):
+        root = self.fixture("stdout-progress")
+        for index in range(3):
+            self.log(root / str(index) / "tarmac.log")
+        for merge_only in (False, True):
+            options = ["--workers", "2", "--progress-stream", "stdout"]
+            if merge_only:
+                options.append("--merge-only")
+            result = subprocess.run([sys.executable, str(ROOT / "tarmac_to_cachegrind.py")] +
+                                    self.args(root, *options), stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, universal_newlines=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("[0/3] starting", result.stdout)
+            for index in range(1, 4):
+                self.assertIn("[{}/3] {}".format(index, "processed" if merge_only else "complete"), result.stdout)
+            self.assertIn("[3/3] generating merged profile", result.stdout)
+            self.assertIn("Completed: 3 succeeded, 0 failed", result.stdout)
+            self.assertNotIn("complete", result.stderr)
+
+    def test_waiting_progress_keeps_completed_count_without_sleep(self):
+        args = batch.build_parser().parse_args(["logs", "--elf", "test.elf", "--progress-stream", "stdout"])
+        tasks = [(Path("a"), Path("a.out")), (Path("b"), Path("b.out"))]
+        with patch.object(batch.multiprocessing, "Pool"), patch.object(batch.queue, "Queue") as queue_factory, \
+                patch("sys.stdout", io.StringIO()) as output, patch("builtins.print", wraps=print) as prints:
+            ready = queue_factory.return_value
+            ready.get.side_effect = [batch.queue.Empty(), (True, "first"),
+                                     batch.queue.Empty(), (True, "second")]
+            self.assertEqual(list(batch.batch_results(tasks, None, args, 2)), ["first", "second"])
+            self.assertIn("[0/2] waiting for workers", output.getvalue())
+            self.assertIn("[1/2] waiting for workers", output.getvalue())
+            self.assertNotIn("[2/2] waiting", output.getvalue())
+            self.assertTrue(all(call[1]["timeout"] == 5.0 for call in ready.get.call_args_list))
+            self.assertTrue(all(call[1]["flush"] for call in prints.call_args_list))
+
     def test_coverage_manifest_and_sets_are_deterministic_across_workers(self):
         from test_coverage import rows, expand
         root = self.fixture("attribution")

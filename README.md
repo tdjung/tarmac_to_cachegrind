@@ -303,6 +303,37 @@ GCC로 4,000개 함수의 디버그 ELF를 만들고, ES/IT 로그 총 12개에 
 절대 시간 예측에는 사용할 수 없습니다. 실제 로그에서는 우선 일부 폴더를 대상으로
 `--workers 1`, `4`, `8`의 보고서 경과 시간을 비교하세요.
 
+### 병렬 진행 상황 출력
+
+배치 시작 시 `[0/450] starting ...`, 파일 완료 시 `[3/450] complete "3_tarmac_core0_cachegrind.out"`
+형식으로 표시합니다. 병렬 worker의 다음 결과를 기다리는 동안에는 5초마다 현재 처리 완료 수와
+경과 시간을 출력합니다. 이 수에는 성공과 실패가 모두 포함되며 실행 중인 파일을 완료로 세지 않습니다.
+
+```text
+[0/450] starting with 4 worker process(es)
+[0/450] waiting for workers; 5.0s elapsed
+[1/450] complete "3_tarmac_core0_cachegrind.out"
+[2/450] complete "1_tarmac_core0_cachegrind.out"
+[2/450] waiting for workers; 15.0s elapsed
+...
+[450/450] generating merged profile and coverage index...
+```
+
+대괄호 안 숫자는 완료 건수이고 파일명 앞 숫자는 테스트 ID이므로 병렬 실행에서는 서로 다를 수 있습니다.
+`--merge-only`에서도 같은 건수를 표시하며 파일별 동작 이름은 `processed`입니다.
+마지막 `450/450` 이후에도 total과 목록 생성이 남아 있으므로 최종 `Completed:`를 확인하세요.
+
+기본 진행 출력은 `stderr`이며 모든 메시지를 즉시 flush합니다. 실행 도구가 stdout만 수집하거나
+`tee`로 진행 상황을 보고 싶다면 `--progress-stream stdout`을 추가하세요. 오류/경고는 계속 stderr입니다.
+
+```bash
+python3 tarmac_to_cachegrind.py /work/test_results --elf core0.elf \
+  --log-name tarmac_core0.log --workers 4 --progress-stream stdout -o /work/coverage
+```
+
+5초 표시는 부모가 결과 큐를 기다릴 때만 동작합니다. 파일 내 진행률을 추정하지 않으며,
+새로운 감시 스레드나 명령어 단위 메시지 전송을 추가하지 않습니다.
+
 ### 실패 처리
 
 각 파일의 성공/실패 및 통계는 `batch_report.json`에 남습니다. 잘못된 로그가 있어도
@@ -545,7 +576,7 @@ gzip -dc core0.log.gz | python3 tarmac_to_cachegrind.py - --elf core0.elf -o cac
 python3 -m unittest discover -s tests -v
 ```
 
-Python 3.6.8 및 3.12.14 인터프리터에서 아래 51개 테스트의 통과를 확인했습니다.
+Python 3.6.8 및 3.12.14 인터프리터에서 아래 53개 테스트의 통과를 확인했습니다.
 `dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,
