@@ -1,0 +1,62 @@
+{
+  "python": "3.6.8 (tags/v3.6.8:3c6b436, Sep 11 2026, 10:28:01) \n[GCC 13.3.0]",
+  "logs": 12,
+  "instructions_per_log": 200000,
+  "lines_per_log": 600000,
+  "functions": 4000,
+  "workers": 4,
+  "results": [
+    {
+      "mode": "before",
+      "round": 1,
+      "seconds": 4.902423184999861,
+      "identical_ir_profiles": 13,
+      "coverage_seconds": 0,
+      "output_bytes": 12860585
+    },
+    {
+      "mode": "coverage",
+      "round": 1,
+      "seconds": 4.980666315999997,
+      "identical_ir_profiles": 13,
+      "coverage_seconds": 0.24696513100002448,
+      "output_bytes": 14010660
+    },
+    {
+      "mode": "coverage",
+      "round": 2,
+      "seconds": 5.0126367980001305,
+      "identical_ir_profiles": 13,
+      "coverage_seconds": 0.25135070500027723,
+      "output_bytes": 14010666
+    },
+    {
+      "mode": "before",
+      "round": 2,
+      "seconds": 4.607917264999969,
+      "identical_ir_profiles": 13,
+      "coverage_seconds": 0,
+      "output_bytes": 12860576
+    },
+    {
+      "mode": "before",
+      "round": 3,
+      "seconds": 4.83328901699997,
+      "identical_ir_profiles": 13,
+      "coverage_seconds": 0,
+      "output_bytes": 12860585
+    },
+    {
+      "mode": "coverage",
+      "round": 3,
+      "seconds": 5.112070858999914,
+      "identical_ir_profiles": 13,
+      "coverage_seconds": 0.244477597999321,
+      "output_bytes": 14010670
+    }
+  ],
+  "median_seconds": {
+    "before": 4.83328901699997,
+    "coverage": 5.0126367980001305
+  }
+}

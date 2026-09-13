@@ -11,7 +11,7 @@ GNU 호환 `addr2line`을 우선 사용합니다. 자동 탐색으로도 찾지 
 경우 주소를 일괄 질의합니다.
 전체 로그를 메모리에 올리거나 명령어 실행마다 외부 프로세스를 만들지 않습니다.
 
-출력 이벤트는 `Ir` 하나입니다. **call graph, 호출 횟수, inclusive cost,
+개별 프로파일의 출력 이벤트는 `Ir` 하나입니다. 배치 total에는 아래 설명한 테스트 커버리지 이벤트도 포함됩니다. **call graph, 호출 횟수, inclusive cost,
 실행 시간, 캐시 hit/miss는 추정하지 않습니다.** Interrupt handler의 명령어도
 해당 PC의 함수/소스에 직접 귀속되므로 호출 스택 복원이 필요하지 않습니다.
 
@@ -81,21 +81,21 @@ python3 tarmac_to_cachegrind.py /work/test_results \
 - 기본 출력 폴더는 `상위폴더/cachegrind-output`입니다. **기존 폴더를 그대로 사용할 수
   있고 같은 이름의 결과 파일은 성공 시 교체합니다.** 이번 실행에서 선택하지 않은 파일은
   유지합니다. merge는 과거 출력 파일을 읽지 않고 이번 실행에서 성공한 로그만 합산합니다.
-- 상대 폴더 경로를 `_`로 연결하고 `.log`/`.log.gz`를 제거해 이름을 만듭니다.
-  루트 바로 아래의 로그는 상위 폴더 자체의 이름을 붙입니다. 충돌하는 이름이 생기면
-  변환 전에 오류로 알리므로 폴더명이나 `--pattern`을 조정하세요.
+- 선택된 로그를 상대 경로순으로 정렬하고 1부터 인덱스를 부여합니다.
+  파일명은 `인덱스_로그이름_cachegrind.out`이며 폴더명은 붙이지 않습니다.
+  `.log`/`.log.gz`는 제거합니다. 병렬 완료 순서가 달라도 번호는 동일합니다.
 
 | 입력(상위폴더 기준) | 출력 파일명 |
 |---|---|
-| `case01/tarmac_core0.log` | `case01_tarmac_core0_cachegrind.out` |
-| `case02/tarmac_core0.log` | `case02_tarmac_core0_cachegrind.out` |
-| `group/case03/tarmac_core0.log.gz` | `group_case03_tarmac_core0_cachegrind.out` |
+| `case01/tarmac_core0.log` | `1_tarmac_core0_cachegrind.out` |
+| `case02/tarmac_core0.log` | `2_tarmac_core0_cachegrind.out` |
+| `group/case03/tarmac_core0.log.gz` | `3_tarmac_core0_cachegrind.out` |
 
 기본 깊이에서는 위 표의 `group/case03` 로그는 제외됩니다. 이 경로까지 포함하려면
 `--max-depth 2`를 지정하세요. 파일명 조건에 맞지 않는 파일은 파일 정보 조회를
 최소화하고, 모든 경로에 `resolve()`를 호출하지 않습니다.
 
-끝에는 **`total_merge_cachegrind.out`**과 **`batch_report.json`**도 생성됩니다.
+끝에는 **`total_merge_cachegrind.out`**, **`coverage_index.json`**, **`batch_report.json`**도 생성됩니다.
 merge는 변환 중 메모리에서 동일한 runtime PC의 `Ir`을 합산한 뒤 공유 ELF의
 파일·함수·라인에 연결합니다. 개별 출력
 파일 800개를 다시 읽는 post-merge 단계가 없습니다. 미실행 라인의 0은 유지되며,
@@ -142,10 +142,92 @@ python3 tarmac_to_cachegrind.py /work/test_results \
 | `--log-name tarmac_core1.log` | `total_merge_tarmac_core1_cachegrind.out` | `batch_report_tarmac_core1.json` |
 | 미지정 (`--pattern`만 사용한 경우 포함) | `total_merge_cachegrind.out` | `batch_report.json` |
 
-같은 코어를 다시 실행하면 그 코어의 개별 파일·합산·보고서만 교체합니다. 기존 결과에
-중복 누적하지 않습니다. `.log`와 그 압축본 `.log.gz`는 같은 출력 이름을 사용하므로
-별도의 결과로 보관하려면 출력 폴더를 분리하세요. 옵션에 적은 파일이 실제로 선택한
+같은 코어를 다시 실행하면 이번에 생성하는 개별 파일·합산·목록·보고서를 교체합니다. 기존 결과에
+중복 누적하지 않습니다. `--log-name`으로 `.log`와 그 압축본 `.log.gz`를 각각 실행하면
+merge/목록 태그가 같으므로 별도로 보관하려면 출력 폴더를 분리하세요.
+한 배치에서 원본과 압축본을 모두 선택하면 각각 별도 테스트로 집계합니다. 옵션에 적은 파일이 실제로 선택한
 ELF와 대응하는지는 사용자가 확인해야 하며, 파일명만으로 자동 검증할 수 없습니다.
+
+### Total에서 커버한 테스트와 커버하지 않은 테스트 확인
+
+추가 옵션 없이 배치 total에 다음 이벤트를 생성합니다. 단일 변환과 개별 프로파일은
+기존 `Ir` 형식을 유지합니다. `--merge-only`에서도 total과 인덱스 목록을 생성합니다.
+
+```text
+events: Ir Tests Covered1 Covered2 Covered3 Covered4 Covered5 CoveredSet Uncovered1 Uncovered2 Uncovered3 Uncovered4 Uncovered5 UncoveredSet
+```
+
+| 이벤트 | 의미 |
+|---|---|
+| `Tests` | 해당 소스 라인을 한 번 이상 실행한 정상 처리 테스트 수 |
+| `Covered1` ~ `Covered5` | 커버한 테스트의 인덱스, 오름차순 앞 5개 |
+| `CoveredSet` | 앞 5개를 제외한 나머지 커버 인덱스 목록의 번호 |
+| `Uncovered1` ~ `Uncovered5` | 커버하지 않은 정상 처리 테스트의 인덱스, 오름차순 앞 5개 |
+| `UncoveredSet` | 앞 5개를 제외한 나머지 미커버 인덱스 목록의 번호 |
+
+빈 슬롯과 나머지 목록이 없는 경우는 `0`입니다. 테스트 ID와 집합 ID는 각각 독립적인
+번호이며 둘 다 1부터 시작합니다. 같은 나머지 목록에는 같은 집합 번호를 사용합니다.
+전체 450개 중 테스트 17, 305만 실행하지 않은 라인은 `Tests=448`,
+`Uncovered1=17`, `Uncovered2=305`, `Uncovered3~5=0`, `UncoveredSet=0`입니다.
+
+목록 파일 이름은 `coverage_index.json`이며, `--log-name tarmac_core0.log` 사용 시
+`coverage_index_tarmac_core0.json`입니다. 두 코어를 같은 폴더에 출력해도 구분됩니다.
+목록에는 다음과 같은 내용이 들어갑니다(일부 항목을 생략한 예시).
+
+```json
+{
+  "tests": [
+    {"index": 1, "input": "case001/tarmac_core0.log",
+     "output": "1_tarmac_core0_cachegrind.out", "status": "successful"}
+  ],
+  "sets": {
+    "42": [6, 8, 14]
+  }
+}
+```
+
+`CoveredSet` 또는 `UncoveredSet`이 42이면 `sets["42"]`의 목록을 확인합니다.
+이 목록에는 **슬롯에 이미 표시한 앞 5개가 포함되지 않습니다.** `tests` 목록에서 각
+인덱스의 실제 입력 경로와 출력 이름을 찾을 수 있습니다. `--merge-only`에서는 출력
+파일이 없으므로 `output`은 null이며 예정 이름은 `planned_output`에 기록합니다.
+
+변환 실패한 테스트는 커버·미커버 양쪽에서 제외하고 `status=failed` 및 오류를 기록합니다.
+실패한 번호는 비워두며 뒤의 번호를 당겨 재배정하지 않습니다. 아무 명령어도 실행하지
+않았지만 EXC/IS 이벤트가 있는 정상 로그는 미커버 테스트로 포함합니다.
+번호는 **이번 선택 목록 안에서만** 유효합니다. 로그 추가·삭제나 선택 옵션 변경 시 번호가
+달라질 수 있으므로 현재 total에 대응하는 목록을 사용하세요. 이전 버전의 폴더명 파일이나
+이번 실행에서 생성하지 않은 과거 파일은 자동 삭제하지 않습니다.
+
+#### 소스 라인 집계 규칙
+
+같은 `(소스 파일, 라인 번호)`에 속하는 모든 PC의 테스트 집합을 합칩니다. 같은 테스트가
+PC 여러 개를 실행해도 라인의 `Tests`는 한 번만 증가합니다. 뷰어가 PC 비용을 라인별로
+더하는 경우 인덱스까지 중복 합산되지 않도록 추가 이벤트는 대표 PC 한 곳에만 기록하고
+나머지 PC의 추가 이벤트는 0으로 기록합니다. `Ir`은 원래 PC별 횟수 그대로입니다.
+소스 위치를 모르는 PC들은 가상의 `???:0` 라인 하나로 합치지 않고 PC별로 유지합니다.
+
+이벤트 인덱스는 **소스 라인에서 읽는 식별자**입니다. 함수 전체 합계·백분율·시간으로
+해석하지 마세요. summary는 형식에 맞춰 열별 합계를 기록하지만 인덱스 합계에는 의미가
+없습니다. `Tests`의 함수 합계도 함수의 고유 테스트 수가 아닙니다. 커버리지 색상 확인에는
+`Ir` 또는 `Tests`를 선택하세요. `Covered5`의 0은 '다섯 번째 테스트 없음'이지 미커버가
+아닙니다. 컴파일되지 않은 소스 라인을 인위적으로 생성하지 않습니다.
+
+현재 검증은 PC→소스 라인 합산 규칙과 출력 데이터에 대한 것이며, 사용자 뷰어에서의
+실제 색상·이벤트 표시 검증은 포함하지 않습니다. 특히 뷰어가 PC 값을 합산하지 않는
+방식이라면 대표 PC 기록 방식과 맞는지 확인해야 합니다.
+
+#### 추가 처리 비용
+
+부모가 파일별 sparse PC 집계에 테스트 비트를 OR하고, 최종 total 생성 때 라인별로
+합칩니다. 성공 테스트 집합의 차집합으로 미커버를 계산합니다. 명령어마다 공유 락을
+사용하지 않고, 로그를 다시 읽거나 450개의 개별 출력을 post-merge하지 않습니다.
+동일한 커버 집합의 이벤트 문자열과 나머지 목록은 재사용합니다.
+
+보고서의 `coverage_seconds`는 테스트 멤버십 추가와 최종 확장 total/목록 생성 시간을
+포함합니다. `merge_seconds`에 포함되는 시간이므로 두 값을 더하면 안 됩니다.
+이 값은 새 기능의 순수 증가분이 아니며, 전체 생성 시간 증가는 변경 전후 실행으로
+비교해야 합니다. 재현 가능한 비교와 측정값은 [성능 결과](tests/COVERAGE_BENCHMARK.md)에
+정리합니다.
 
 ### 속도 개선과 병렬 실행
 
@@ -175,7 +257,7 @@ ELF와 대응하는지는 사용자가 확인해야 하며, 파일명만으로 �
 
 동시성 안전성은 다음과 같이 확보합니다.
 
-- worker마다 독립적인 실행 횟수·소스 조회 캐시를 갖고, 충돌 여부를 사전 검사한
+- worker마다 독립적인 실행 횟수·소스 조회 캐시를 갖고, 고유 인덱스를 부여한
   서로 다른 출력 파일만 씁니다. 임시 파일 기록 후 atomic replace가 성공해야 완료로 처리합니다.
 - worker는 sparse PC 횟수와 통계만 반환합니다. 부모만 total을 수정하고 마지막에 한 번
   기록하므로 **명령어마다 공유 카운터를 잠그는 critical section이 없습니다.**
@@ -204,7 +286,7 @@ python3 tests/benchmark_batch.py --baseline /tmp/tarmac_before.py --workers 4
 
 GCC로 4,000개 함수의 디버그 ELF를 만들고, ES/IT 로그 총 12개에 각각 실행 명령어
 20만 개와 레지스터/메모리 기록을 넣습니다(총 720만 줄). 기존 순차·개선 순차·개선 병렬의
-전체 변환 시간을 측정하고 **개별 12개 + total 1개 출력의 SHA-256 일치**를 검증합니다.
+전체 변환 시간을 측정하고 **개별 12개 + total 1개의 PC·소스·Ir 일치**를 검증합니다.
 준비 데이터와 결과는 종료 후 제거됩니다. 도구 실행·파싱·coverage 출력·merge를 포함하며
 로그 생성 시간은 제외합니다. 캐시와 장비 부하에 영향받는 합성 측정이며 실제 Arm 로그의
 수분~십수분 완료를 보장하지 않습니다.
@@ -230,7 +312,7 @@ JSON의 `partial_merge`를 true로 기록합니다. 출력 프로파일에는 `d
 모두 실패하면 새로운 total은 만들지 않습니다. 이전 total이 있으면 보존하되 갱신되지
 않았다는 경고를 출력합니다. 실패한 개별 파일의 이전 결과도 보존하고 이번 merge에는
 넣지 않습니다. 이렇게 보존된 파일은 보고서의 `preserved_previous_outputs`에서 확인할
-수 있습니다. `merged_output: null`이면 이번 실행에서 생성한 merge가 없습니다. ELF 분석 실패나 출력 이름 충돌 등 공통 오류는
+수 있습니다. `merged_output: null`이면 이번 실행에서 생성한 merge가 없습니다. ELF 분석 실패 등 공통 오류는
 변환 시작 전에 중단합니다. 실행 명령어가 0개라도 EXC/IS 같은 인식 가능한 이벤트가
 있으면 기본 coverage 모드에서 0으로 처리하지만, 빈 파일이나 무관한 텍스트는 실패합니다.
 
@@ -244,10 +326,11 @@ Searching /work/test_results (max-depth=1)...
 Search complete: 800 logs in 0.25s
 Found 800 logs; analyzing ELF...
 ELF analysis complete in 3.10s
-[1/800] complete "case01_tarmac_core0_cachegrind.out"
-[2/800] complete "case01_tarmac_core1_cachegrind.out"
+[1/800] complete "1_tarmac_core0_cachegrind.out"
+[2/800] complete "2_tarmac_core1_cachegrind.out"
 ...
 [800/800] complete "case400_tarmac_core1_cachegrind.out"
+complete "coverage_index.json"
 complete "total_merge_cachegrind.out"
 complete "batch_report.json"
 Completed: 800 succeeded, 0 failed; ...
@@ -462,7 +545,7 @@ gzip -dc core0.log.gz | python3 tarmac_to_cachegrind.py - --elf core0.elf -o cac
 python3 -m unittest discover -s tests -v
 ```
 
-Python 3.6.8 및 3.12.14 인터프리터에서 아래 46개 테스트의 통과를 확인했습니다.
+Python 3.6.8 및 3.12.14 인터프리터에서 아래 51개 테스트의 통과를 확인했습니다.
 `dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,
@@ -473,8 +556,8 @@ Python 3.6.8 및 3.12.14 인터프리터에서 아래 46개 테스트의 통과�
   실행 PC 전용 모드 및 잘못된 objdump 지정 시 기존 출력 보존.
 - addr2line 없는 PATH에서 실제 objdump fallback: 두 trace 형식, offset, CSV,
   미실행 함수, 실행 PC 전용 모드, 미해결 PC 보존 및 명시적 도구 경로 오류.
-- 800개 합성 로그의 일괄 변환/merge 및 ELF 분석 재사용, 재귀 파일명, 패턴 필터,
-  부분 실패 보고, 출력 충돌/덮어쓰기, merge 전용 모드 및 배치 fallback.
+- 800개 합성 로그의 일괄 변환/merge 및 ELF 분석 재사용, 인덱스 파일명, 패턴 필터,
+  부분 실패 보고, 인덱스를 통한 이름 충돌 방지/덮어쓰기, merge 전용 모드 및 배치 fallback.
 - 깊이 0/1/2의 탐색 결과, 제한 아래 폴더를 열지 않는지, 음수 깊이 거부를 검증합니다.
 - 서로 다른 실제 ELF 두 개를 파일명으로 선택해 같은 폴더에 출력, 재실행 시 덮어쓰기,
   다른 코어 결과 보존, 정확한 파일명 비교 및 실패 시 과거 출력 보고를 검증합니다.
@@ -482,6 +565,8 @@ Python 3.6.8 및 3.12.14 인터프리터에서 아래 46개 테스트의 통과�
   사용자 뷰어 자체의 로딩 검증은 포함하지 않습니다.
 - 실제 worker 프로세스에서 순차/병렬 출력 일치, gzip·미등록 PC·부분 실패·이전 출력
   보존·0 비용, spawn 모드의 merge-only/executed-only 및 잘못된 worker 수를 검증합니다.
+- 라인 내 여러 PC의 테스트 집합 합집합, 450개 테스트의 커버/미커버 목록, 넘침 집합 재사용,
+  실패 번호 제외 및 순차/병렬 total·인덱스 목록 일치를 검증합니다.
 - 반복 해석 캐시가 CCFAIL·fetch 실패·IS/IF·malformed 및 실행 횟수를 보존하는지 검증합니다.
 
 ELF 통합 테스트에는 `gcc`, `nm`, `addr2line`, `objdump`가 필요하며 없으면 해당 테스트가

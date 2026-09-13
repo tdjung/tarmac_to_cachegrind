@@ -15,6 +15,21 @@ import test_converter as single_tests
 ROOT = single_tests.ROOT
 
 
+def ir_profile(text):
+    """Project an enriched merge onto the legacy Ir profile for regression checks."""
+    lines = []
+    for line in text.splitlines():
+        if line.startswith("events:"):
+            line = "events: Ir"
+        elif line.startswith("0x"):
+            line = " ".join(line.split()[:3])
+        elif line.startswith("summary:"):
+            line = " ".join(line.split()[:2])
+        lines.append(line)
+    return "\n".join(lines) + "\n"
+
+
+
 @unittest.skipUnless(all(shutil.which(t) for t in ("gcc", "nm", "addr2line", "objdump")),
                      "batch integration requires gcc and binutils")
 class BatchTests(unittest.TestCase):
@@ -58,7 +73,7 @@ class BatchTests(unittest.TestCase):
         outputs = [self.directory / "serial-output", self.directory / "parallel-output"]
         for workers, output in zip((1, 3), outputs):
             output.mkdir()
-            old_name = "parallel_tarmac_bad_cachegrind.out"
+            old_name = "10_tarmac_bad_cachegrind.out"
             (output / old_name).write_text("previous failed output")
             result = subprocess.run([sys.executable, str(ROOT / "tarmac_to_cachegrind.py")] +
                                     self.args(root, "--workers", str(workers), "-o", str(output)),
@@ -95,8 +110,8 @@ class BatchTests(unittest.TestCase):
             stderr=subprocess.PIPE, universal_newlines=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         output = root / "cachegrind-output"
-        self.assertEqual(len(list(output.iterdir())), 2)
-        merged = (output / "total_merge_tarmac_core0_cachegrind.out").read_text()
+        self.assertEqual(len(list(output.iterdir())), 3)
+        merged = ir_profile((output / "total_merge_tarmac_core0_cachegrind.out").read_text())
         self.assertTrue(merged.endswith("summary: 5\n"))
         self.assertNotIn("fn=never_called", merged)
 
@@ -104,6 +119,40 @@ class BatchTests(unittest.TestCase):
         for workers in ("0", "-1"):
             with patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
                 batch.build_parser().parse_args(["logs", "--elf", "test.elf", "--workers", workers])
+
+    def test_coverage_manifest_and_sets_are_deterministic_across_workers(self):
+        from test_coverage import rows, expand
+        root = self.fixture("attribution")
+        for index in range(1, 15):
+            path = root / "case{:03d}".format(index) / "tarmac_core0.log"
+            self.log(path, "it" if index % 2 else "es")
+            if index == 7:
+                path.write_text("IT broken")
+            elif index == 10:
+                path.write_text("ES EXC [1] Reset")
+        previous = None
+        for workers in (1, 3):
+            output = self.directory / "attribution-output{}".format(workers)
+            with patch("sys.stderr", io.StringIO()):
+                self.assertEqual(batch.main(self.args(root, "--workers", str(workers),
+                                                     "--log-name", "tarmac_core0.log", "-o", str(output))), 1)
+            merged = (output / "total_merge_tarmac_core0_cachegrind.out").read_text()
+            index_text = (output / "coverage_index_tarmac_core0.json").read_text()
+            if previous is not None:
+                self.assertEqual((merged, index_text), previous)
+            previous = merged, index_text
+            lookup = json.loads(index_text)
+            self.assertEqual((lookup["successful_tests"], lookup["failed_tests"]), (13, 1))
+            self.assertEqual([entry["index"] for entry in lookup["tests"]], list(range(1, 15)))
+            self.assertEqual(lookup["tests"][6]["status"], "failed")
+            self.assertIsNone(lookup["tests"][6]["output"])
+            self.assertEqual(lookup["tests"][0]["output"], "1_tarmac_core0_cachegrind.out")
+            self.assertEqual(lookup["tests"][0]["input"], "case001/tarmac_core0.log")
+            self.assertFalse((output / "7_tarmac_core0_cachegrind.out").exists())
+            values = rows(merged)[self.pcs["work"]]
+            self.assertEqual(values[1], 12)
+            self.assertEqual(expand(values, 2, lookup["sets"]), set(range(1, 15)) - {7, 10})
+            self.assertEqual(expand(values, 8, lookup["sets"]), {10})
 
     def test_800_logs_share_elf_analysis_and_merge_counts(self):
         root = self.fixture("large")
@@ -113,17 +162,17 @@ class BatchTests(unittest.TestCase):
             self.log(folder / "tarmac_b.log", "it")
         with patch.object(subprocess, "run", wraps=subprocess.run) as calls, patch("sys.stderr", io.StringIO()) as progress, patch("builtins.print", wraps=print) as prints:
             self.assertEqual(batch.main(self.args(root)), 0)
-        self.assertIn('[1/800] complete "case000_tarmac_a_cachegrind.out"', progress.getvalue())
-        self.assertIn('[800/800] complete "case399_tarmac_b_cachegrind.out"', progress.getvalue())
+        self.assertIn('[1/800] complete "1_tarmac_a_cachegrind.out"', progress.getvalue())
+        self.assertIn('[800/800] complete "800_tarmac_b_cachegrind.out"', progress.getvalue())
         self.assertIn('complete "total_merge_cachegrind.out"', progress.getvalue())
         completion_calls = [call for call in prints.call_args_list if 'complete "' in str(call[0][0])]
-        self.assertEqual(len(completion_calls), 802)  # 800 profiles, total, report
+        self.assertEqual(len(completion_calls), 803)  # 800 profiles, total, index, report
         self.assertTrue(all(call[1].get("flush") is True for call in completion_calls))
         # One objdump plus one addr2line batch for this small ELF, not 800 each.
         self.assertEqual(calls.call_count, 2)
         output = root / "cachegrind-output"
         self.assertEqual(len(list(output.glob("*_cachegrind.out"))), 801)
-        merged = (output / "total_merge_cachegrind.out").read_text()
+        merged = ir_profile((output / "total_merge_cachegrind.out").read_text())
         self.assertTrue(merged.startswith("# callgrind format\n"))
         self.assertIn("positions: instr line\nevents: Ir\n", merged)
         self.assertIn("0x{:x} 1 800\n".format(self.pcs["work"]), merged)
@@ -133,7 +182,7 @@ class BatchTests(unittest.TestCase):
         report = json.loads((output / "batch_report.json").read_text())
         self.assertEqual(len(report["successful"]), 800)
         self.assertEqual(report["failed"], [])
-        self.assertTrue((output / "case000_tarmac_a_cachegrind.out").exists())
+        self.assertTrue((output / "1_tarmac_a_cachegrind.out").exists())
 
     def test_non_tarmac_ignored_and_failed_candidate_reported(self):
         root = self.fixture("partial")
@@ -146,7 +195,7 @@ class BatchTests(unittest.TestCase):
         report = json.loads((output / "batch_report.json").read_text())
         self.assertEqual(report["matched"], 2)
         self.assertEqual(len(report["failed"]), 1)
-        self.assertTrue((output / "nested_deep_tarmac_good_cachegrind.out").exists())
+        self.assertTrue((output / "1_tarmac_good_cachegrind.out").exists())
         self.assertTrue(report["partial_merge"])
         self.assertNotIn("desc:", (output / "total_merge_cachegrind.out").read_text())
         self.assertTrue((output / "total_merge_cachegrind.out").read_text().startswith("# callgrind format\n"))
@@ -160,17 +209,17 @@ class BatchTests(unittest.TestCase):
             self.assertEqual(batch.main(args), 0)
             self.assertEqual(batch.main(args), 0)
         output = root / "cachegrind-output"
-        self.assertEqual({p.name for p in output.iterdir()}, {"batch_report.json", "total_merge_cachegrind.out"})
-        self.assertTrue((output / "total_merge_cachegrind.out").read_text().endswith("summary: 1\n"))
+        self.assertEqual({p.name for p in output.iterdir()}, {"batch_report.json", "total_merge_cachegrind.out", "coverage_index.json"})
+        self.assertTrue(ir_profile((output / "total_merge_cachegrind.out").read_text()).endswith("summary: 1\n"))
 
-    def test_colliding_flat_names_rejected(self):
+    def test_indices_prevent_colliding_flat_names(self):
         root = self.fixture("collision")
         self.log(root / "a_b" / "tarmac_x.log")
         self.log(root / "a" / "b" / "tarmac_x.log")
         with patch("sys.stderr", io.StringIO()) as err:
-            self.assertEqual(batch.main(self.args(root, "--max-depth", "2")), 1)
-        self.assertIn("collision", err.getvalue())
-        self.assertFalse((root / "cachegrind-output").exists())
+            self.assertEqual(batch.main(self.args(root, "--max-depth", "2")), 0)
+        self.assertTrue((root / "cachegrind-output" / "1_tarmac_x_cachegrind.out").exists())
+        self.assertTrue((root / "cachegrind-output" / "2_tarmac_x_cachegrind.out").exists())
 
     def test_depth_limit_prunes_before_opening_deeper_directories(self):
         root = self.fixture("depth")
@@ -219,15 +268,15 @@ class BatchTests(unittest.TestCase):
         merge0 = output / "total_merge_tarmac_core0_cachegrind.out"
         merge1 = output / "total_merge_tarmac_core1_cachegrind.out"
         expected1 = merge1.read_text()
-        self.assertIn("0x{:x} 1 1\n".format(other_pc), expected1)
+        self.assertIn("0x{:x} 1 1\n".format(other_pc), ir_profile(expected1))
         self.assertIn('ob: "{}"'.format(other_elf), expected1)
         merge0.write_text("old")
-        individual = output / "case_tarmac_core0_cachegrind.out"
+        individual = output / "1_tarmac_core0_cachegrind.out"
         individual.write_text("old")
         (output / "keep.txt").write_text("keep")
         with patch("sys.stderr", io.StringIO()):
             self.assertEqual(batch.main(args0), 0)
-        self.assertIn("0x{:x} 1 1\n".format(self.pcs["work"]), merge0.read_text())
+        self.assertIn("0x{:x} 1 1\n".format(self.pcs["work"]), ir_profile(merge0.read_text()))
         self.assertTrue(individual.read_text().endswith("summary: 1\n"))
         self.assertEqual(merge1.read_text(), expected1)
         self.assertEqual((output / "keep.txt").read_text(), "keep")
@@ -261,8 +310,20 @@ class BatchTests(unittest.TestCase):
         output = root / "cachegrind-output"
         report = json.loads((output / "batch_report_tarmac.json").read_text())
         self.assertIsNone(report["merged_output"])
-        self.assertEqual(len(report["preserved_previous_outputs"]), 2)
+        self.assertEqual(len(report["preserved_previous_outputs"]), 3)
         self.assertIn("total_merge_tarmac_cachegrind.out", report["preserved_previous_outputs"])
+
+    def test_index_write_failure_preserves_previous_total(self):
+        root = self.fixture("blocked-index")
+        self.log(root / "tarmac.log")
+        output = root / "cachegrind-output"
+        output.mkdir()
+        total = output / "total_merge_cachegrind.out"
+        total.write_text("previous total")
+        (output / "coverage_index.json").mkdir()
+        with patch("sys.stderr", io.StringIO()):
+            self.assertEqual(batch.main(self.args(root)), 1)
+        self.assertEqual(total.read_text(), "previous total")
 
     def test_real_cli_fallback(self):
         root = self.fixture("fallback")
@@ -274,7 +335,7 @@ class BatchTests(unittest.TestCase):
             universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("using objdump -l", result.stderr)
-        merged = (root / "cachegrind-output" / "total_merge_cachegrind.out").read_text()
+        merged = ir_profile((root / "cachegrind-output" / "total_merge_cachegrind.out").read_text())
         self.assertRegex(merged, r"fn=work\n0x[0-9a-f]+ 1 1\n")
 
     def test_copied_single_script_supports_file_and_directory(self):

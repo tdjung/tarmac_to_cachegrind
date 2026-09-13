@@ -1,12 +1,13 @@
 """Opt-in synthetic benchmark; not collected by unittest. Python 3.6+."""
 import argparse
-import hashlib
 import json
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import time
+
+from benchmark_coverage import ir_hash
 
 
 def main():
@@ -56,13 +57,14 @@ def main():
             started = time.monotonic()
             subprocess.check_call(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             elapsed = time.monotonic() - started
-            hashes = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-                      for path in output.glob("*.out")}
+            report = json.loads((output / "batch_report.json").read_text())
+            hashes = {item["input"]: ir_hash(output / item["output"]) for item in report["successful"]}
+            hashes["TOTAL"] = ir_hash(output / report["merged_output"])
             if expected is None:
                 expected = hashes
             if hashes != expected:
-                raise RuntimeError("profile bytes differ from baseline: " + label)
-            result = {"mode": label, "seconds": elapsed, "identical_profiles": len(hashes)}
+                raise RuntimeError("PC/line/Ir differs from baseline: " + label)
+            result = {"mode": label, "seconds": elapsed, "identical_ir_profiles": len(hashes)}
             results.append(result)
             print(json.dumps(result), flush=True)
         print(json.dumps({"python": sys.version, "logs": args.logs, "instructions_per_log": args.instructions,

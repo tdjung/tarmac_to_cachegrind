@@ -447,12 +447,15 @@ class ProfileContext:
             if source.file == "???" or source.line == 0:
                 stats.unknown_source_instructions += count
 
-    def write(self, out, counts):
+    def output_layout(self, counts):
         # Reuse sorted, preformatted zero-coverage rows. Only an observed PC
         # outside the baseline requires a per-output extended layout.
         extras = [Position(pc, *self.sources[pc]) for pc in counts
                   if pc not in self.baseline_pcs]
-        layout = self.make_layout(list(self.baseline) + extras) if extras else self.layout
+        return self.make_layout(list(self.baseline) + extras) if extras else self.layout
+
+    def write(self, out, counts):
+        layout = self.output_layout(counts)
         out.write("# callgrind format\npositions: instr line\nevents: Ir\n")
         out.write("ob: " + json.dumps(str(self.elf), ensure_ascii=False) + "\n")
         get = counts.get
@@ -496,15 +499,97 @@ def discover(root, patterns, output_dir, max_depth=1, log_name=None):
     return sorted(found)
 
 
-def output_name(path, root):
-    relative = path.relative_to(root)
-    name = relative.name
+def output_name(path, index):
+    name = path.name
     if name.endswith(".gz"):
         name = name[:-3]
     if name.endswith(".log"):
         name = name[:-4]
-    folders = relative.parts[:-1] or (root.name,)
-    return "_".join(folders + (name, "cachegrind.out"))
+    return "{}_{}_cachegrind.out".format(index, name)
+
+
+COVERAGE_EVENTS = (["Tests"] + ["Covered{}".format(i) for i in range(1, 6)] +
+                   ["CoveredSet"] + ["Uncovered{}".format(i) for i in range(1, 6)] +
+                   ["UncoveredSet"])
+
+
+def mask_indices(mask):
+    while mask:
+        bit = mask & -mask
+        yield bit.bit_length()
+        mask ^= bit
+
+
+class CoverageIndex:
+    """Parent-owned sparse PC membership; expand each distinct set only once."""
+
+    def __init__(self):
+        self.pc_masks = {}
+        self.success_mask = 0
+        self.set_ids = {}
+        self.sets = {}
+        self.rows = {}
+
+    def add(self, index, counts):
+        bit = 1 << (index - 1)
+        self.success_mask |= bit
+        masks = self.pc_masks
+        for pc, count in counts.items():
+            if count:
+                masks[pc] = masks.get(pc, 0) | bit
+
+    def slots(self, mask):
+        first = []
+        for _ in range(5):
+            if not mask:
+                break
+            bit = mask & -mask
+            first.append(bit.bit_length())
+            mask ^= bit
+        first.extend([0] * (5 - len(first)))
+        set_id = 0
+        if mask:
+            set_id = self.set_ids.get(mask)
+            if set_id is None:
+                set_id = len(self.set_ids) + 1
+                self.set_ids[mask] = set_id
+                self.sets[str(set_id)] = list(mask_indices(mask))
+        return first + [set_id]
+
+    def row(self, covered):
+        if covered not in self.rows:
+            # int.bit_count is unavailable on Python 3.6.
+            values = ([bin(covered).count("1")] + self.slots(covered) +
+                      self.slots(self.success_mask ^ covered))
+            self.rows[covered] = (values, " " + " ".join(map(str, values)) + "\n")
+        return self.rows[covered]
+
+    @staticmethod
+    def line_key(pc, source):
+        # Unknown locations must not all collapse into the artificial ???:0 line.
+        return (source.file, source.line) if source.file != "???" and source.line > 0 else (None, pc)
+
+    def write(self, out, context, counts):
+        layout = context.output_layout(counts)
+        anchors, line_masks = {}, {}
+        for pc, _, _ in layout:
+            key = self.line_key(pc, context.sources[pc])
+            anchors.setdefault(key, pc)
+            line_masks[key] = line_masks.get(key, 0) | self.pc_masks.get(pc, 0)
+        out.write("# callgrind format\npositions: instr line\nevents: Ir " +
+                  " ".join(COVERAGE_EVENTS) + "\n")
+        out.write("ob: " + json.dumps(str(context.elf), ensure_ascii=False) + "\n")
+        summary = [sum(counts.values())] + [0] * len(COVERAGE_EVENTS)
+        zero = " 0" * len(COVERAGE_EVENTS) + "\n"
+        for pc, prefix, _ in layout:
+            key = self.line_key(pc, context.sources[pc])
+            suffix = zero
+            if pc == anchors[key]:
+                values, suffix = self.row(line_masks[key])
+                for i, value in enumerate(values, 1):
+                    summary[i] += value
+            out.write(prefix + str(counts.get(pc, 0)) + suffix)
+        out.write("summary: " + " ".join(map(str, summary)) + "\n")
 
 
 _WORKER_CONTEXT = None
@@ -595,15 +680,15 @@ def run_batch(args):
     print("Search complete: {} logs in {:.2f}s".format(len(paths), time.monotonic() - started), file=sys.stderr, flush=True)
     if not paths:
         raise ConversionError("no matching logs found")
-    names = [output_name(path, root) for path in paths]
-    if len(set(names)) != len(names):
-        raise ConversionError("output filename collision; narrow --pattern or rename colliding input folders/logs")
+    indices = {path: i for i, path in enumerate(paths, 1)}
+    names = [output_name(path, indices[path]) for path in paths]
     print("Found {} logs; analyzing ELF...".format(len(paths)), file=sys.stderr, flush=True)
     started = time.monotonic()
     context = ProfileContext(args)
     print("ELF analysis complete in {:.2f}s".format(time.monotonic() - started), file=sys.stderr, flush=True)
     output.mkdir(parents=True, exist_ok=True)
     total = Counter()
+    coverage = CoverageIndex()
     workers = min(args.workers, len(paths))
     print("Converting with {} worker process(es)...".format(workers), file=sys.stderr, flush=True)
     tag = ""
@@ -616,27 +701,39 @@ def run_batch(args):
         tag = "_" + tag
     merge_name = "total_merge" + tag + "_cachegrind.out"
     report_name = "batch_report" + tag + ".json"
+    index_name = "coverage_index" + tag + ".json"
+    manifest = [{"index": indices[path], "input": str(path.relative_to(root)),
+                 "output": None, "planned_output": name, "status": "pending"}
+                for path, name in zip(paths, names)]
     report = {"elf": str(args.elf.resolve()), "root": str(root), "matched": len(paths),
               "successful": [], "failed": [], "total_instructions": 0,
               "merged_output": None, "max_depth": args.max_depth, "partial_merge": False,
               "log_name": args.log_name, "preserved_previous_outputs": [],
-              "workers": workers, "merge_seconds": 0.0}
+              "workers": workers, "merge_seconds": 0.0, "coverage_seconds": 0.0,
+              "coverage_index": None}
     tasks = [(path, output / name) for path, name in zip(paths, names)]
     for index, result in enumerate(batch_results(tasks, context, args, workers), 1):
         path, name, counts, stats, timings, error = result
+        test_index = indices[path]
+        entry = manifest[test_index - 1]
         if error is None:
             merge_started = time.monotonic()
             total.update(counts)
+            coverage_started = time.monotonic()
+            coverage.add(test_index, counts)
+            report["coverage_seconds"] += time.monotonic() - coverage_started
             report["merge_seconds"] += time.monotonic() - merge_started
             report["total_instructions"] += stats["instructions"]
-            report["successful"].append({"input": str(path.relative_to(root)),
+            entry.update(status="successful", output=None if args.merge_only else name)
+            report["successful"].append({"input": str(path.relative_to(root)), "index": test_index,
                                          "output": None if args.merge_only else name,
                                          "stats": stats, "seconds": timings})
             action = "processed" if args.merge_only else "complete"
             label = str(path.relative_to(root)) if args.merge_only else name
             print("[{}/{}] {} {}".format(index, len(paths), action, json.dumps(label, ensure_ascii=False)), file=sys.stderr, flush=True)
         else:
-            report["failed"].append({"input": str(path.relative_to(root)), "error": error})
+            entry.update(status="failed", error=error)
+            report["failed"].append({"input": str(path.relative_to(root)), "index": test_index, "error": error})
             if not args.merge_only and (output / name).exists():
                 report["preserved_previous_outputs"].append(name)
                 print("warning: previous output preserved, excluded from this merge: " + name, file=sys.stderr, flush=True)
@@ -645,8 +742,21 @@ def run_batch(args):
         name = merge_name
         merge_started = time.monotonic()
         context.resolve(total)
+        coverage_started = time.monotonic()
         with atomic_text(output / name) as file:
-            context.write(file, total)
+            coverage.write(file, context, total)
+            with atomic_text(output / index_name) as index_file:
+                json.dump({"version": 1, "elf": str(args.elf.resolve()), "root": str(root),
+                           "merged_output": merge_name, "tests": manifest,
+                           "successful_tests": len(report["successful"]),
+                           "failed_tests": len(report["failed"]),
+                           "set_semantics": "remaining indices after the first five; 0 means empty",
+                           "line_semantics": "union by source file and line; unknown locations kept per PC",
+                           "sets": coverage.sets}, index_file, indent=2, sort_keys=True)
+                index_file.write("\n")
+        report["coverage_seconds"] += time.monotonic() - coverage_started
+        report["coverage_index"] = index_name
+        print("complete " + json.dumps(index_name), file=sys.stderr, flush=True)
         report["merge_seconds"] += time.monotonic() - merge_started
         if report["failed"]:
             report["partial_merge"] = True
@@ -656,6 +766,8 @@ def run_batch(args):
     if not report["successful"] and (output / merge_name).exists():
         report["preserved_previous_outputs"].append(merge_name)
         print("warning: all logs failed; previous merge was not updated: " + merge_name, file=sys.stderr, flush=True)
+        if (output / index_name).exists():
+            report["preserved_previous_outputs"].append(index_name)
     report["successful"].sort(key=lambda item: item["input"])
     report["failed"].sort(key=lambda item: item["input"])
     report["preserved_previous_outputs"].sort()
