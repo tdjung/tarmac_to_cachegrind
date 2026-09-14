@@ -565,8 +565,18 @@ class CoverageIndex:
             self.rows[covered] = (values, " " + " ".join(map(str, values)) + "\n")
         return self.rows[covered]
 
+    @staticmethod
+    def line_key(pc, source):
+        return (source.file, source.line) if source.file != "???" and source.line > 0 else (None, pc)
+
     def write(self, out, context, counts):
         layout = context.output_layout(counts)
+        anchors, line_masks = {}, {}
+        for pc, _, _ in layout:
+            if counts.get(pc, 0) > 0:
+                key = self.line_key(pc, context.sources[pc])
+                anchors.setdefault(key, pc)
+                line_masks[key] = line_masks.get(key, 0) | self.pc_masks.get(pc, 0)
         out.write("# callgrind format\npositions: instr line\nevents: Ir " +
                   " ".join(COVERAGE_EVENTS) + "\n")
         out.write("ob: " + json.dumps(str(context.elf), ensure_ascii=False) + "\n")
@@ -575,8 +585,9 @@ class CoverageIndex:
         for pc, prefix, _ in layout:
             count = counts.get(pc, 0)
             suffix = zero
-            if count > 0:
-                values, suffix = self.row(self.pc_masks.get(pc, 0))
+            key = self.line_key(pc, context.sources[pc])
+            if count > 0 and pc == anchors[key]:
+                values, suffix = self.row(line_masks[key])
                 for i, value in enumerate(values, 1):
                     summary[i] += value
             out.write(prefix + str(count) + suffix)
@@ -751,12 +762,14 @@ def run_batch(args):
         with atomic_text(output / name) as file:
             coverage.write(file, context, total)
             with atomic_text(output / index_name) as index_file:
-                json.dump({"version": 2, "elf": str(args.elf.resolve()), "root": str(root),
+                json.dump({"version": 3, "elf": str(args.elf.resolve()), "root": str(root),
                            "merged_output": merge_name, "tests": manifest,
                            "successful_tests": len(report["successful"]),
                            "failed_tests": len(report["failed"]),
                            "set_semantics": "remaining indices after the first five; 0 means empty",
-                           "coverage_unit": "instruction_pc",
+                           "coverage_unit": "source_line",
+                           "line_semantics": "union by file and line; stored on one executed PC; unknown locations kept per PC",
+                           "assembly_guidance": "only Ir is an instruction-level metric; other events are source-line metadata",
                            "zero_ir_semantics": "all coverage events are zero when total PC Ir is zero",
                            "sets": coverage.sets}, index_file, indent=2, sort_keys=True)
                 index_file.write("\n")
