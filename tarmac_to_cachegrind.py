@@ -561,35 +561,25 @@ class CoverageIndex:
         if covered not in self.rows:
             # int.bit_count is unavailable on Python 3.6.
             values = ([bin(covered).count("1")] + self.slots(covered) +
-                      self.slots(self.success_mask ^ covered))
+                      self.slots(self.success_mask ^ covered)) if covered else [0] * len(COVERAGE_EVENTS)
             self.rows[covered] = (values, " " + " ".join(map(str, values)) + "\n")
         return self.rows[covered]
 
-    @staticmethod
-    def line_key(pc, source):
-        # Unknown locations must not all collapse into the artificial ???:0 line.
-        return (source.file, source.line) if source.file != "???" and source.line > 0 else (None, pc)
-
     def write(self, out, context, counts):
         layout = context.output_layout(counts)
-        anchors, line_masks = {}, {}
-        for pc, _, _ in layout:
-            key = self.line_key(pc, context.sources[pc])
-            anchors.setdefault(key, pc)
-            line_masks[key] = line_masks.get(key, 0) | self.pc_masks.get(pc, 0)
         out.write("# callgrind format\npositions: instr line\nevents: Ir " +
                   " ".join(COVERAGE_EVENTS) + "\n")
         out.write("ob: " + json.dumps(str(context.elf), ensure_ascii=False) + "\n")
         summary = [sum(counts.values())] + [0] * len(COVERAGE_EVENTS)
         zero = " 0" * len(COVERAGE_EVENTS) + "\n"
         for pc, prefix, _ in layout:
-            key = self.line_key(pc, context.sources[pc])
+            count = counts.get(pc, 0)
             suffix = zero
-            if pc == anchors[key]:
-                values, suffix = self.row(line_masks[key])
+            if count > 0:
+                values, suffix = self.row(self.pc_masks.get(pc, 0))
                 for i, value in enumerate(values, 1):
                     summary[i] += value
-            out.write(prefix + str(counts.get(pc, 0)) + suffix)
+            out.write(prefix + str(count) + suffix)
         out.write("summary: " + " ".join(map(str, summary)) + "\n")
 
 
@@ -761,12 +751,13 @@ def run_batch(args):
         with atomic_text(output / name) as file:
             coverage.write(file, context, total)
             with atomic_text(output / index_name) as index_file:
-                json.dump({"version": 1, "elf": str(args.elf.resolve()), "root": str(root),
+                json.dump({"version": 2, "elf": str(args.elf.resolve()), "root": str(root),
                            "merged_output": merge_name, "tests": manifest,
                            "successful_tests": len(report["successful"]),
                            "failed_tests": len(report["failed"]),
                            "set_semantics": "remaining indices after the first five; 0 means empty",
-                           "line_semantics": "union by source file and line; unknown locations kept per PC",
+                           "coverage_unit": "instruction_pc",
+                           "zero_ir_semantics": "all coverage events are zero when total PC Ir is zero",
                            "sets": coverage.sets}, index_file, indent=2, sort_keys=True)
                 index_file.write("\n")
         report["coverage_seconds"] += time.monotonic() - coverage_started

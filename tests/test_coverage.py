@@ -1,4 +1,4 @@
-"""Coverage attribution, line aggregation, sparse IDs and overflow references."""
+"""PC coverage attribution, zero-Ir suppression, sparse IDs and overflow references."""
 from collections import Counter
 import io
 import json
@@ -34,7 +34,7 @@ def context_for(sources):
 
 
 class CoverageTests(unittest.TestCase):
-    def test_union_same_line_and_failed_ids_excluded(self):
+    def test_independent_pcs_on_same_line_and_failed_ids_excluded(self):
         context = context_for({
             0x100: converter.Source('a.c', 'foo', 1),
             0x102: converter.Source('a.c', 'foo', 1),
@@ -57,13 +57,14 @@ class CoverageTests(unittest.TestCase):
         out = io.StringIO()
         coverage.write(out, context, total)
         data = rows(out.getvalue())
-        expected = {1, 2, 3, 4, 5, 6, 8, 14}
+        expected = {1, 2, 3, 4, 5, 6, 8}
         self.assertEqual(data[0x100][1], len(expected))
         self.assertEqual(expand(data[0x100], 2, coverage.sets), expected)
         self.assertEqual(expand(data[0x100], 8, coverage.sets), successful - expected)
-        self.assertEqual(data[0x102][1:], [0] * 13)
-        self.assertEqual(data[0x104][1:8], [0] * 7)
-        self.assertEqual(expand(data[0x104], 8, coverage.sets), successful)
+        self.assertEqual(data[0x102][1], 2)
+        self.assertEqual(expand(data[0x102], 2, coverage.sets), {2, 14})
+        self.assertEqual(expand(data[0x102], 8, coverage.sets), successful - {2, 14})
+        self.assertEqual(data[0x104], [0] * 14)
         self.assertEqual(expand(data[0x106], 2, coverage.sets), successful)
         self.assertEqual(data[0x106][8:], [0] * 6)
         self.assertEqual(expand(data[0x108], 2, coverage.sets), {1})
@@ -73,6 +74,28 @@ class CoverageTests(unittest.TestCase):
             self.assertEqual(len(values), 14)
         summary = list(map(int, out.getvalue().split('summary: ')[1].split()))
         self.assertEqual(summary, [sum(values[i] for values in data.values()) for i in range(14)])
+
+    def test_zero_ir_and_later_instruction_on_same_line(self):
+        context = context_for({pc: converter.Source('a.c', 'foo', 1) for pc in (0x100, 0x102, 0x104)})
+        coverage = converter.CoverageIndex()
+        coverage.add(1, Counter({0x102: 2, 0x104: 1}))
+        # Normal zero-execution tests are still uncovered for executed PCs.
+        for index in range(2, 9):
+            coverage.add(index, Counter())
+        out = io.StringIO()
+        coverage.write(out, context, Counter({0x102: 2, 0x104: 1}))
+        data = rows(out.getvalue())
+        self.assertEqual(data[0x100], [0] * 14)
+        self.assertEqual(data[0x102][1:], data[0x104][1:])
+        self.assertEqual(expand(data[0x102], 2, coverage.sets), {1})
+        self.assertEqual(expand(data[0x102], 8, coverage.sets), set(range(2, 9)))
+        zero_coverage = converter.CoverageIndex()
+        for index in range(1, 9):
+            zero_coverage.add(index, Counter())
+        out = io.StringIO()
+        zero_coverage.write(out, context, Counter())
+        self.assertTrue(all(values == [0] * 14 for values in rows(out.getvalue()).values()))
+        self.assertEqual(zero_coverage.sets, {})
 
     def test_slots_padding_and_only_remaining_indices_in_set(self):
         coverage = converter.CoverageIndex()
