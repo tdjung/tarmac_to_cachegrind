@@ -217,6 +217,15 @@ class BatchTests(unittest.TestCase):
         self.assertEqual(len(report["successful"]), 800)
         self.assertEqual(report["failed"], [])
         self.assertTrue((output / "1_case000_tarmac_a_cachegrind.out").exists())
+        # Re-merging all 800 individual outputs must reproduce the full enriched
+        # total, including line unions, overflow IDs and zero-Ir behavior.
+        selection = root / "profiles.txt"
+        selection.write_text("cachegrind-output\n")
+        remerged = root / "remerged.out"
+        with patch("sys.stderr", io.StringIO()):
+            self.assertEqual(batch.main(["--merge-list", str(selection), "--merge-pattern",
+                                         "*_tarmac_*_cachegrind.out", "-o", str(remerged)]), 0)
+        self.assertEqual(remerged.read_bytes(), (output / "total_merge_cachegrind.out").read_bytes())
 
     def test_non_tarmac_ignored_and_failed_candidate_reported(self):
         root = self.fixture("partial")

@@ -1,5 +1,9 @@
 # Tarmac → Cachegrind
 
+처음 사용한다면 [INTRO.html](INTRO.html)의 **한국어 / English 빠른 시작**을 참고하세요.
+저장소를 내려받고 브라우저에서 열면 언어 전환과 명령어 복사를 사용할 수 있습니다.
+외부 인터넷 연결은 필요하지 않습니다. GitHub 파일 페이지에서는 HTML 소스가 표시됩니다.
+
 두 가지 Arm Tarmac 로그 형식의 **PC별 명령어 실행 횟수**를 ELF와 결합해
 PC·함수·파일·소스 라인별 **flat 프로파일**로 변환합니다.
 
@@ -396,6 +400,100 @@ Completed: 800 succeeded, 0 failed; ...
 `--output-dir`도 사용할 수 있습니다. `--pc-counts`, `--stats`, `--skip-malformed`는
 단일 로그 전용이며 배치는 `batch_report.json`에 파일별 통계를 기록합니다.
 
+## 기존 결과에서 일부 테스트만 선택해 다시 merge
+
+`--merge-list`는 **이미 생성한 개별 Cachegrind 파일**을 읽어 새 total과 테스트 인덱스를
+생성합니다. Tarmac 재파싱이나 ELF/objdump/addr2line 실행이 필요하지 않습니다.
+기존 `--merge-only`는 Tarmac을 변환하면서 개별 출력 생성을 생략하는 옵션으로, 용도가 다릅니다.
+
+예를 들어 `selected.txt`에 결과 폴더를 적습니다.
+
+```text
+# 폴더 또는 개별 파일을 한 줄에 하나씩 지정
+/work/coverage
+```
+
+제외할 결과는 선택적으로 `excluded.txt`에 적습니다.
+
+```text
+/work/coverage/17_case017_tarmac_cm4_cachegrind.out
+/work/coverage/35_case035_tarmac_cm4_cachegrind.out
+```
+
+```bash
+python3 tarmac_to_cachegrind.py \
+  --merge-list selected.txt \
+  --merge-pattern '*_tarmac_cm4_cachegrind.out' \
+  --exclude-list excluded.txt \
+  -o /work/coverage/selected_cm4_cachegrind.out
+```
+
+제외할 항목이 없으면 `--exclude-list`를 생략하세요. 폴더마다 같은 이름의 파일을
+가져오려면 `--merge-name core0_cachegrind.out`처럼 지정할 수 있습니다.
+`--merge-name`은 `--merge-pattern`의 별칭이며 정확한 파일명과 wildcard를 모두 받습니다.
+숫자 접두사가 없는 파일은 아래 설명한 `--reindex`가 필요합니다.
+
+개별 파일만 직접 나열할 때에는 패턴 옵션이 필요하지 않습니다. 파일과 폴더를
+한 목록에 섞어도 됩니다.
+
+```text
+/work/coverage/1_case001_tarmac_cm4_cachegrind.out
+/work/coverage/8_case008_tarmac_cm4_cachegrind.out
+```
+
+```bash
+python3 tarmac_to_cachegrind.py --merge-list selected.txt \
+  -o /work/coverage/selected_cm4_cachegrind.out
+```
+
+### 목록과 번호 처리
+
+- UTF-8 텍스트이며 BOM, 빈 줄, `#`로 시작하는 주석 줄을 허용합니다.
+  상대 경로는 **목록 파일이 있는 폴더** 기준입니다. 공백이 들어간 경로도 따옴표 없이
+  한 줄에 그대로 적으세요. 경로 내부의 `#`는 주석으로 처리하지 않습니다.
+- 폴더 항목은 그 폴더 **바로 안의 파일만** 읽습니다. 하위 폴더를 재귀 탐색하지 않습니다.
+  폴더가 포함되면 `--merge-pattern`이 필수이며 여러 번 지정할 수 있습니다.
+  셸에서 패턴이 먼저 확장되지 않도록 명령줄의 wildcard를 따옴표로 감싸세요.
+- 제외 목록도 같은 규칙과 패턴을 사용합니다. 중복 지정한 파일과 같은 파일을 가리키는
+  hard link는 한 번만 합칩니다. 폴더 탐색은 symlink를 따라가지 않지만 직접 지정한
+  파일 symlink는 해석합니다.
+- 기본적으로 `17_...`의 **원래 번호 17을 유지**합니다. 일부를 제외해도 나머지 번호는
+  바뀌지 않습니다. 번호가 없거나 다른 파일과 중복되면 오류로 종료합니다.
+- 여러 실행 묶음에 동일한 번호가 있으면 `--reindex`를 추가하세요. 선택한 파일의 정규화된
+  절대 경로 정렬 순서로 1부터 번호를 다시 부여합니다. 입력 파일명은 변경하지 않으며,
+  새 번호와 실제 입력 파일의 관계는 새 인덱스 JSON에 기록합니다.
+- `Tests`, Covered/Uncovered 및 나머지 집합 번호는 **이번에 선택된 테스트만** 대상으로
+  다시 계산합니다. 제외된 테스트는 Uncovered에도 나타나지 않습니다.
+  소스 라인별 대표 실행 PC에만 추가 이벤트를 기록하고, `Ir=0`인 PC의 추가 이벤트는
+  모두 0으로 유지합니다. Assembly 화면에서는 `Ir`만 instruction 단위로 해석하세요.
+
+### 결과와 입력 검증
+
+위 명령은 다음 세 파일을 생성하며 기존 동일 경로의 결과는 교체합니다.
+출력 파일의 상위 폴더는 미리 존재해야 합니다.
+
+```text
+selected_cm4_cachegrind.out
+selected_cm4_cachegrind.out.coverage_index.json
+selected_cm4_cachegrind.out.merge_report.json
+```
+
+다른 코어는 다른 출력 이름을 지정하면 total 및 보조 파일이 충돌하지 않습니다.
+집합 번호 해석에는 해당 total과 함께 생성된 인덱스 JSON을 사용하세요.
+진행 상황은 `[3/450] merged "..."` 형태이며 `--progress-stream stdout`도 지원합니다.
+이 모드는 기존 출력만 순차 집계하므로 `--workers` 병렬 변환 옵션을 사용하지 않습니다.
+
+입력은 이 도구가 생성한 **`positions: instr line`, `events: Ir`의 개별 출력**입니다.
+일반적인 모든 Callgrind 문법이나 이미 여러 이벤트를 가진 total의 재merge는 지원하지
+않습니다. 폴더 탐색에서는 `total_merge`로 시작하는 파일과 이번 출력 경로를 자동 제외합니다.
+그 외 이름의 과거 total이 패턴에 걸리면 오류가 나므로 개별 결과에 맞는 패턴을 사용하세요.
+
+모든 입력의 `ob:` ELF 경로와 동일 PC의 파일·함수·라인 매핑을 비교하며 잘린 파일,
+Ir summary 불일치 등을 거부합니다. 이는 ELF 바이너리 해시 검증은 아니므로 **같은 실행
+이미지에서 생성한 결과**만 선택하세요. 입력 검증 실패 시 기존 결과를 교체하지 않습니다.
+미실행 PC는 선택된 입력에 들어 있는 주소의 합집합으로 유지합니다. 입력을
+`--executed-only`로 만들었다면 원래 빠져 있던 ELF 주소를 이 모드에서 복원할 수는 없습니다.
+
 ## 지원하는 로그
 
 ### ES / Tarmac Text Rev 3t
@@ -593,7 +691,7 @@ gzip -dc core0.log.gz | python3 tarmac_to_cachegrind.py - --elf core0.elf -o cac
 python3 -m unittest discover -s tests -v
 ```
 
-Python 3.6.8 및 3.12.14 인터프리터에서 아래 54개 테스트의 통과를 확인했습니다.
+Python 3.6.8 및 3.12.14 인터프리터에서 아래 62개 테스트의 통과를 확인했습니다.
 `dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,
@@ -615,6 +713,9 @@ Python 3.6.8 및 3.12.14 인터프리터에서 아래 54개 테스트의 통과�
   보존·0 비용, spawn 모드의 merge-only/executed-only 및 잘못된 worker 수를 검증합니다.
 - 같은 라인의 테스트 집합 합집합, 대표 실행 PC 선택, Ir=0의 추가 이벤트 0 처리, 450개 테스트의 커버/미커버 목록, 넘침 집합 재사용,
   실패 번호 제외 및 순차/병렬 total·인덱스 목록 일치를 검증합니다.
+- 기존 출력 선택 merge: 목록 상대 경로·공백·BOM·중복·제외·비재귀 탐색, 원래 번호 유지와
+  재번호 부여, 큰 번호의 밀집 비트마스크, ELF/매핑/summary 오류 및 기존 출력 보존을 검증합니다.
+  800개 개별 출력의 재merge total이 최초 배치 total과 바이트 단위로 일치함을 확인합니다.
 - 반복 해석 캐시가 CCFAIL·fetch 실패·IS/IF·malformed 및 실행 횟수를 보존하는지 검증합니다.
 
 ELF 통합 테스트에는 `gcc`, `nm`, `addr2line`, `objdump`가 필요하며 없으면 해당 테스트가

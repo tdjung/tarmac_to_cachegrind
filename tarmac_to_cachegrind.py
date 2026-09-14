@@ -524,12 +524,18 @@ def mask_indices(mask):
 class CoverageIndex:
     """Parent-owned sparse PC membership; expand each distinct set only once."""
 
-    def __init__(self):
+    def __init__(self, test_ids=None):
         self.pc_masks = {}
         self.success_mask = 0
         self.set_ids = {}
         self.sets = {}
         self.rows = {}
+        # Re-merge may retain sparse/large filename IDs. Masks always use
+        # dense internal positions; display IDs are sorted by the caller.
+        self.test_ids = test_ids
+
+    def display_id(self, index):
+        return self.test_ids[index - 1] if self.test_ids is not None else index
 
     def add(self, index, counts):
         bit = 1 << (index - 1)
@@ -545,7 +551,7 @@ class CoverageIndex:
             if not mask:
                 break
             bit = mask & -mask
-            first.append(bit.bit_length())
+            first.append(self.display_id(bit.bit_length()))
             mask ^= bit
         first.extend([0] * (5 - len(first)))
         set_id = 0
@@ -554,7 +560,7 @@ class CoverageIndex:
             if set_id is None:
                 set_id = len(self.set_ids) + 1
                 self.set_ids[mask] = set_id
-                self.sets[str(set_id)] = list(mask_indices(mask))
+                self.sets[str(set_id)] = [self.display_id(i) for i in mask_indices(mask)]
         return first + [set_id]
 
     def row(self, covered):
@@ -802,10 +808,213 @@ def run_batch(args):
 
 
 
+def file_identity(path):
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino
+
+
+def list_profiles(list_path, patterns, outputs, excluding=False):
+    """Paths are relative to the list file; directory entries are not recursive."""
+    found = {}
+    with list_path.open(encoding="utf-8-sig") as file:
+        for number, raw in enumerate(file, 1):
+            entry = raw.strip()
+            if not entry or entry.startswith("#"):
+                continue
+            path = Path(entry).expanduser()
+            if not path.is_absolute():
+                path = list_path.parent / path
+            path = path.resolve()
+            if path.is_dir():
+                if not patterns:
+                    raise ConversionError("{}:{}: folder entries require --merge-pattern (or --merge-name)".format(list_path, number))
+                candidates = []
+                with os.scandir(str(path)) as children:
+                    for child in children:
+                        if (any(fnmatch.fnmatchcase(child.name, pattern) for pattern in patterns)
+                                and child.is_file(follow_symlinks=False)):
+                            candidate = Path(child.path).resolve()
+                            if candidate in outputs or child.name.startswith("total_merge"):
+                                continue
+                            candidates.append(candidate)
+                if not candidates and not excluding:
+                    raise ConversionError("{}:{}: no matching individual profiles in {}".format(list_path, number, path))
+            elif path.is_file():
+                if path in outputs:
+                    raise ConversionError("merge input and output must differ: {}".format(path))
+                if path.name.startswith("total_merge"):
+                    raise ConversionError("select individual profiles, not total_merge files: {}".format(path))
+                candidates = [path]
+            else:
+                raise ConversionError("{}:{}: file/folder not found: {}".format(list_path, number, path))
+            for candidate in sorted(candidates):
+                found.setdefault(file_identity(candidate), candidate)
+    return found
+
+
+def read_ir_profile(path):
+    """Read this converter's absolute PC/line/Ir format, not arbitrary callgrind.
+
+    Reject multi-event totals: their original test membership cannot be recovered
+    by treating the aggregate as an individual test. Require a matching summary
+    so a truncated file is never silently merged.
+    """
+    counts, sources, headers = Counter(), {}, {}
+    filename = function = None
+    summary = None
+    opener = gzip.open if path.name.endswith(".gz") else open
+    with opener(str(path), "rt", encoding="utf-8-sig", errors="strict") as file:
+        for number, raw in enumerate(file, 1):
+            line = raw.rstrip("\r\n")
+            if not line.strip() or line.startswith("#"):
+                continue
+            try:
+                if summary is not None:
+                    raise ValueError("records after summary")
+                if line.startswith(("positions:", "events:", "ob:")):
+                    key, value = line.split(":", 1)
+                    if key in headers or sources:
+                        raise ValueError("duplicate or misplaced header")
+                    headers[key] = value.strip()
+                    if key == "events" and value.split() != ["Ir"]:
+                        raise ValueError("only individual Ir-only profiles are supported; do not merge totals")
+                elif line.startswith("fl="):
+                    filename, function = line[3:], None
+                elif line.startswith("fn="):
+                    function = line[3:]
+                elif line.startswith("summary:"):
+                    summary = int(line.split(":", 1)[1].strip())
+                elif line.startswith(("0x", "0X")):
+                    if headers.get("positions") != "instr line" or headers.get("events") != "Ir":
+                        raise ValueError("expected positions: instr line and events: Ir")
+                    if filename is None or function is None:
+                        raise ValueError("missing fl/fn before instruction")
+                    pc_text, line_text, cost_text = line.split()
+                    pc, line_number, cost = int(pc_text, 16), int(line_text), int(cost_text)
+                    if min(pc, line_number, cost) < 0:
+                        raise ValueError("negative PC, line or Ir")
+                    source = Source(filename, function, line_number)
+                    if pc in sources and sources[pc] != source:
+                        raise ValueError("conflicting source mapping for PC")
+                    sources[pc] = source
+                    if cost:
+                        counts[pc] += cost
+                else:
+                    raise ValueError("unsupported record; use this converter's individual output")
+            except ValueError as exc:
+                raise ConversionError("{}:{}: {}".format(path, number, exc)) from exc
+    if not sources or summary is None or summary != sum(counts.values()):
+        raise ConversionError("{}: missing instructions/summary or Ir summary mismatch".format(path))
+    try:
+        obj = json.loads(headers["ob"])
+        if not isinstance(obj, str) or not obj:
+            raise ValueError("invalid object path")
+    except (KeyError, ValueError) as exc:
+        raise ConversionError("{}: expected ob: followed by a quoted ELF path".format(path)) from exc
+    return counts, sources, obj
+
+
+def run_profile_merge(args):
+    if (args.trace is not None or args.elf or args.output_dir or args.output is None or
+            args.pattern or args.log_name or args.merge_only or args.workers != 1 or
+            args.addr2line or args.objdump or args.executed_only or args.load_offset or
+            args.skip_malformed or args.pc_counts or args.stats or args.input_format != "auto" or args.max_depth != 1):
+        raise ConversionError("--merge-list requires -o FILE and uses existing profiles; omit trace/ELF and conversion options")
+    started = time.monotonic()
+    listing = args.merge_list.resolve()
+    output = args.output.resolve()
+    index_path = output.with_name(output.name + ".coverage_index.json")
+    report_path = output.with_name(output.name + ".merge_report.json")
+    outputs = {output, index_path, report_path}
+    lists = [listing] + ([args.exclude_list.resolve()] if args.exclude_list else [])
+    for destination in outputs:
+        if destination.is_dir() or not destination.parent.is_dir():
+            raise ConversionError("invalid output path (parent must exist): {}".format(destination))
+        for source in lists:
+            if destination == source or (destination.exists() and source.exists() and destination.samefile(source)):
+                raise ConversionError("output must not overwrite a selection list")
+    progress("Reading merge selection: {}".format(listing), args)
+    selected = list_profiles(listing, args.merge_pattern, outputs)
+    excluded = list_profiles(lists[1], args.merge_pattern, outputs, excluding=True) if args.exclude_list else {}
+    selected = {identity: path for identity, path in selected.items() if identity not in excluded}
+    if not selected:
+        raise ConversionError("no individual profiles remain after selection/exclusion")
+    for destination in outputs:
+        if destination.exists() and file_identity(destination) in selected:
+            raise ConversionError("output aliases an input profile: {}".format(destination))
+    paths = sorted(selected.values())
+    if args.reindex:
+        entries = list(enumerate(paths, 1))
+    else:
+        entries, used = [], set()
+        for path in paths:
+            match = re.match(r"^([1-9][0-9]*)_", path.name)
+            if not match:
+                raise ConversionError("missing test index prefix in {}; use --reindex".format(path))
+            index = int(match.group(1))
+            if index in used:
+                raise ConversionError("duplicate test index {}; narrow the selection or use --reindex".format(index))
+            used.add(index)
+            entries.append((index, path))
+        entries.sort()
+    coverage = CoverageIndex([index for index, _ in entries])
+    total, sources, obj, manifest = Counter(), {}, None, []
+    progress("[0/{}] merging existing profiles".format(len(entries)), args)
+    for internal_index, (test_index, path) in enumerate(entries, 1):
+        counts, mapping, current_obj = read_ir_profile(path)
+        if obj is None:
+            obj = current_obj
+        elif obj != current_obj:
+            raise ConversionError("ELF object mismatch in {}; merge only profiles from the same image".format(path))
+        for pc, source in mapping.items():
+            if pc in sources and sources[pc] != source:
+                raise ConversionError("{}: conflicting source mapping at PC 0x{:x}".format(path, pc))
+        sources.update(mapping)
+        total.update(counts)
+        coverage.add(internal_index, counts)
+        manifest.append({"index": test_index, "input": str(path), "output": str(path),
+                         "status": "successful", "instructions": sum(counts.values())})
+        progress("[{}/{}] merged {}".format(internal_index, len(entries), json.dumps(str(path), ensure_ascii=False)), args)
+    context = ProfileContext.__new__(ProfileContext)
+    context.elf, context.sources = Path(obj), sources
+    context.baseline = Counter({Position(pc, *source): 0 for pc, source in sources.items()})
+    context.baseline_pcs = set(sources)
+    context.layout = context.make_layout(context.baseline)
+    # All selected files must pass before any result is replaced.
+    with atomic_text(output) as file:
+        coverage.write(file, context, total)
+        with atomic_text(index_path) as index_file:
+            json.dump({"version": 3, "elf": obj, "input_kind": "individual_profile",
+                       "merged_output": str(output), "tests": manifest,
+                       "successful_tests": len(entries), "failed_tests": 0,
+                       "coverage_unit": "source_line", "indices_preserved": not args.reindex,
+                       "set_semantics": "remaining indices after the first five; 0 means empty",
+                       "line_semantics": "union by file and line; stored on one executed PC; unknown locations kept per PC",
+                       "zero_ir_semantics": "all coverage events are zero when total PC Ir is zero",
+                       "assembly_guidance": "only Ir is an instruction-level metric; other events are source-line metadata",
+                       "sets": coverage.sets}, index_file, indent=2, sort_keys=True)
+            index_file.write("\n")
+    report = {"mode": "merge_list", "selection_list": str(listing), "merged": len(entries),
+              "total_instructions": sum(total.values()), "merged_output": str(output),
+              "coverage_index": str(index_path), "indices_preserved": not args.reindex,
+              "inputs": manifest, "elapsed_seconds": time.monotonic() - started}
+    with atomic_text(report_path) as file:
+        json.dump(report, file, indent=2, sort_keys=True)
+        file.write("\n")
+    for path in (output, index_path, report_path):
+        progress("complete " + json.dumps(str(path), ensure_ascii=False), args)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("trace", help="Tarmac log, - for stdin, or parent folder for recursive batch conversion")
-    parser.add_argument("--elf", required=True, type=Path, help="matching ELF, preferably with DWARF (-g)")
+    parser.add_argument("trace", nargs="?", help="Tarmac log, - for stdin, or parent folder (omit with --merge-list)")
+    parser.add_argument("--elf", type=Path, help="matching ELF, required for trace conversion; not used with --merge-list")
+    parser.add_argument("--merge-list", type=Path, help="merge existing individual profiles listed as files/folders, one path per line")
+    parser.add_argument("--merge-pattern", "--merge-name", action="append", dest="merge_pattern",
+                        type=log_basename, help="merge-list: filename or basename glob inside listed folders; repeatable, non-recursive")
+    parser.add_argument("--exclude-list", type=Path, help="merge-list: exclude files/folders from this path list")
+    parser.add_argument("--reindex", action="store_true", help="merge-list: assign new test IDs instead of retaining filename index prefixes")
     output = parser.add_mutually_exclusive_group()
     output.add_argument("-o", "--output", type=Path, help="output file, or output directory in batch mode (existing files replaced)")
     output.add_argument("--output-dir", type=Path, help="batch output directory (default: ROOT/cachegrind-output)")
@@ -856,6 +1065,12 @@ def validate_paths(args: argparse.Namespace) -> None:
 def main(argv: Optional[List[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     try:
+        if args.merge_list:
+            return run_profile_merge(args)
+        if args.merge_pattern or args.exclude_list or args.reindex:
+            raise ConversionError("--merge-pattern, --exclude-list and --reindex require --merge-list")
+        if args.trace is None or args.elf is None:
+            raise ConversionError("trace conversion requires a trace/folder and --elf; use --merge-list for existing profiles")
         if Path(args.trace).is_dir() or args.output_dir is not None:
             if args.pc_counts or args.stats or args.skip_malformed:
                 raise ConversionError("--pc-counts, --stats and --skip-malformed are single-log options; batch writes batch_report.json")
