@@ -73,7 +73,7 @@ class BatchTests(unittest.TestCase):
         outputs = [self.directory / "serial-output", self.directory / "parallel-output"]
         for workers, output in zip((1, 3), outputs):
             output.mkdir()
-            old_name = "10_tarmac_bad_cachegrind.out"
+            old_name = "10_parallel_tarmac_bad_cachegrind.out"
             (output / old_name).write_text("previous failed output")
             result = subprocess.run([sys.executable, str(ROOT / "tarmac_to_cachegrind.py")] +
                                     self.args(root, "--workers", str(workers), "-o", str(output)),
@@ -180,9 +180,9 @@ class BatchTests(unittest.TestCase):
             self.assertEqual([entry["index"] for entry in lookup["tests"]], list(range(1, 15)))
             self.assertEqual(lookup["tests"][6]["status"], "failed")
             self.assertIsNone(lookup["tests"][6]["output"])
-            self.assertEqual(lookup["tests"][0]["output"], "1_tarmac_core0_cachegrind.out")
+            self.assertEqual(lookup["tests"][0]["output"], "1_case001_tarmac_core0_cachegrind.out")
             self.assertEqual(lookup["tests"][0]["input"], "case001/tarmac_core0.log")
-            self.assertFalse((output / "7_tarmac_core0_cachegrind.out").exists())
+            self.assertFalse((output / "7_case007_tarmac_core0_cachegrind.out").exists())
             values = rows(merged)[self.pcs["work"]]
             self.assertEqual(values[1], 12)
             self.assertEqual(expand(values, 2, lookup["sets"]), set(range(1, 15)) - {7, 10})
@@ -196,8 +196,8 @@ class BatchTests(unittest.TestCase):
             self.log(folder / "tarmac_b.log", "it")
         with patch.object(subprocess, "run", wraps=subprocess.run) as calls, patch("sys.stderr", io.StringIO()) as progress, patch("builtins.print", wraps=print) as prints:
             self.assertEqual(batch.main(self.args(root)), 0)
-        self.assertIn('[1/800] complete "1_tarmac_a_cachegrind.out"', progress.getvalue())
-        self.assertIn('[800/800] complete "800_tarmac_b_cachegrind.out"', progress.getvalue())
+        self.assertIn('[1/800] complete "1_case000_tarmac_a_cachegrind.out"', progress.getvalue())
+        self.assertIn('[800/800] complete "800_case399_tarmac_b_cachegrind.out"', progress.getvalue())
         self.assertIn('complete "total_merge_cachegrind.out"', progress.getvalue())
         completion_calls = [call for call in prints.call_args_list if 'complete "' in str(call[0][0])]
         self.assertEqual(len(completion_calls), 803)  # 800 profiles, total, index, report
@@ -216,7 +216,7 @@ class BatchTests(unittest.TestCase):
         report = json.loads((output / "batch_report.json").read_text())
         self.assertEqual(len(report["successful"]), 800)
         self.assertEqual(report["failed"], [])
-        self.assertTrue((output / "1_tarmac_a_cachegrind.out").exists())
+        self.assertTrue((output / "1_case000_tarmac_a_cachegrind.out").exists())
 
     def test_non_tarmac_ignored_and_failed_candidate_reported(self):
         root = self.fixture("partial")
@@ -229,7 +229,7 @@ class BatchTests(unittest.TestCase):
         report = json.loads((output / "batch_report.json").read_text())
         self.assertEqual(report["matched"], 2)
         self.assertEqual(len(report["failed"]), 1)
-        self.assertTrue((output / "1_tarmac_good_cachegrind.out").exists())
+        self.assertTrue((output / "1_nested_deep_tarmac_good_cachegrind.out").exists())
         self.assertTrue(report["partial_merge"])
         self.assertNotIn("desc:", (output / "total_merge_cachegrind.out").read_text())
         self.assertTrue((output / "total_merge_cachegrind.out").read_text().startswith("# callgrind format\n"))
@@ -252,8 +252,8 @@ class BatchTests(unittest.TestCase):
         self.log(root / "a" / "b" / "tarmac_x.log")
         with patch("sys.stderr", io.StringIO()) as err:
             self.assertEqual(batch.main(self.args(root, "--max-depth", "2")), 0)
-        self.assertTrue((root / "cachegrind-output" / "1_tarmac_x_cachegrind.out").exists())
-        self.assertTrue((root / "cachegrind-output" / "2_tarmac_x_cachegrind.out").exists())
+        self.assertTrue((root / "cachegrind-output" / "1_a_b_tarmac_x_cachegrind.out").exists())
+        self.assertTrue((root / "cachegrind-output" / "2_a_b_tarmac_x_cachegrind.out").exists())
 
     def test_depth_limit_prunes_before_opening_deeper_directories(self):
         root = self.fixture("depth")
@@ -305,7 +305,7 @@ class BatchTests(unittest.TestCase):
         self.assertIn("0x{:x} 1 1\n".format(other_pc), ir_profile(expected1))
         self.assertIn('ob: "{}"'.format(other_elf), expected1)
         merge0.write_text("old")
-        individual = output / "1_tarmac_core0_cachegrind.out"
+        individual = output / "1_case_tarmac_core0_cachegrind.out"
         individual.write_text("old")
         (output / "keep.txt").write_text("keep")
         with patch("sys.stderr", io.StringIO()):

@@ -499,13 +499,14 @@ def discover(root, patterns, output_dir, max_depth=1, log_name=None):
     return sorted(found)
 
 
-def output_name(path, index):
+def output_name(path, index, root):
     name = path.name
     if name.endswith(".gz"):
         name = name[:-3]
     if name.endswith(".log"):
         name = name[:-4]
-    return "{}_{}_cachegrind.out".format(index, name)
+    folders = path.relative_to(root).parts[:-1] or (root.name,)
+    return "{}_{}_{}_cachegrind.out".format(index, "_".join(folders), name)
 
 
 COVERAGE_EVENTS = (["Tests"] + ["Covered{}".format(i) for i in range(1, 6)] +
@@ -694,7 +695,7 @@ def run_batch(args):
     if not paths:
         raise ConversionError("no matching logs found")
     indices = {path: i for i, path in enumerate(paths, 1)}
-    names = [output_name(path, indices[path]) for path in paths]
+    names = [output_name(path, indices[path], root) for path in paths]
     progress("Found {} logs; analyzing ELF...".format(len(paths)), args)
     started = time.monotonic()
     context = ProfileContext(args)

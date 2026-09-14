@@ -82,14 +82,15 @@ python3 tarmac_to_cachegrind.py /work/test_results \
   있고 같은 이름의 결과 파일은 성공 시 교체합니다.** 이번 실행에서 선택하지 않은 파일은
   유지합니다. merge는 과거 출력 파일을 읽지 않고 이번 실행에서 성공한 로그만 합산합니다.
 - 선택된 로그를 상대 경로순으로 정렬하고 1부터 인덱스를 부여합니다.
-  파일명은 `인덱스_로그이름_cachegrind.out`이며 폴더명은 붙이지 않습니다.
+  파일명은 `인덱스_폴더_로그이름_cachegrind.out`입니다. 폴더는 입력 루트 기준
+  상대 경로를 `_`로 연결합니다. 루트 바로 아래 로그에는 입력 루트의 폴더명을 붙입니다.
   `.log`/`.log.gz`는 제거합니다. 병렬 완료 순서가 달라도 번호는 동일합니다.
 
 | 입력(상위폴더 기준) | 출력 파일명 |
 |---|---|
-| `case01/tarmac_core0.log` | `1_tarmac_core0_cachegrind.out` |
-| `case02/tarmac_core0.log` | `2_tarmac_core0_cachegrind.out` |
-| `group/case03/tarmac_core0.log.gz` | `3_tarmac_core0_cachegrind.out` |
+| `case01/tarmac_core0.log` | `1_case01_tarmac_core0_cachegrind.out` |
+| `case02/tarmac_core0.log` | `2_case02_tarmac_core0_cachegrind.out` |
+| `group/case03/tarmac_core0.log.gz` | `3_group_case03_tarmac_core0_cachegrind.out` |
 
 기본 깊이에서는 위 표의 `group/case03` 로그는 제외됩니다. 이 경로까지 포함하려면
 `--max-depth 2`를 지정하세요. 파일명 조건에 맞지 않는 파일은 파일 정보 조회를
@@ -178,7 +179,7 @@ events: Ir Tests Covered1 Covered2 Covered3 Covered4 Covered5 CoveredSet Uncover
 {
   "tests": [
     {"index": 1, "input": "case001/tarmac_core0.log",
-     "output": "1_tarmac_core0_cachegrind.out", "status": "successful"}
+     "output": "1_case001_tarmac_core0_cachegrind.out", "status": "successful"}
   ],
   "sets": {
     "42": [6, 8, 14]
@@ -195,7 +196,7 @@ events: Ir Tests Covered1 Covered2 Covered3 Covered4 Covered5 CoveredSet Uncover
 실패한 번호는 비워두며 뒤의 번호를 당겨 재배정하지 않습니다. 아무 명령어도 실행하지
 않았지만 EXC/IS 이벤트가 있는 정상 로그는 미커버 테스트로 포함합니다.
 번호는 **이번 선택 목록 안에서만** 유효합니다. 로그 추가·삭제나 선택 옵션 변경 시 번호가
-달라질 수 있으므로 현재 total에 대응하는 목록을 사용하세요. 이전 버전의 폴더명 파일이나
+달라질 수 있으므로 현재 total에 대응하는 목록을 사용하세요. 이전 버전의 파일명으로 생성된 파일이나
 이번 실행에서 생성하지 않은 과거 파일은 자동 삭제하지 않습니다.
 
 #### 소스 라인 집계 규칙
@@ -305,15 +306,15 @@ GCC로 4,000개 함수의 디버그 ELF를 만들고, ES/IT 로그 총 12개에 
 
 ### 병렬 진행 상황 출력
 
-배치 시작 시 `[0/450] starting ...`, 파일 완료 시 `[3/450] complete "3_tarmac_core0_cachegrind.out"`
+배치 시작 시 `[0/450] starting ...`, 파일 완료 시 `[3/450] complete "3_case003_tarmac_core0_cachegrind.out"`
 형식으로 표시합니다. 병렬 worker의 다음 결과를 기다리는 동안에는 5초마다 현재 처리 완료 수와
 경과 시간을 출력합니다. 이 수에는 성공과 실패가 모두 포함되며 실행 중인 파일을 완료로 세지 않습니다.
 
 ```text
 [0/450] starting with 4 worker process(es)
 [0/450] waiting for workers; 5.0s elapsed
-[1/450] complete "3_tarmac_core0_cachegrind.out"
-[2/450] complete "1_tarmac_core0_cachegrind.out"
+[1/450] complete "3_case003_tarmac_core0_cachegrind.out"
+[2/450] complete "1_case001_tarmac_core0_cachegrind.out"
 [2/450] waiting for workers; 15.0s elapsed
 ...
 [450/450] generating merged profile and coverage index...
@@ -357,10 +358,10 @@ Searching /work/test_results (max-depth=1)...
 Search complete: 800 logs in 0.25s
 Found 800 logs; analyzing ELF...
 ELF analysis complete in 3.10s
-[1/800] complete "1_tarmac_core0_cachegrind.out"
-[2/800] complete "2_tarmac_core1_cachegrind.out"
+[1/800] complete "1_case001_tarmac_core0_cachegrind.out"
+[2/800] complete "2_case001_tarmac_core1_cachegrind.out"
 ...
-[800/800] complete "case400_tarmac_core1_cachegrind.out"
+[800/800] complete "800_case400_tarmac_core1_cachegrind.out"
 complete "coverage_index.json"
 complete "total_merge_cachegrind.out"
 complete "batch_report.json"
