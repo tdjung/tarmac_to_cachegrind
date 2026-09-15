@@ -49,7 +49,7 @@ HTML에 포함되지 않습니다. 링크를 누르려면 해당 파일을 함�
 GitHub와 README는 별도 링크입니다. 브랜치나 문서 위치를 추측하지 않으므로
 `--github-url`만 지정해도 README 주소가 자동으로 바뀌지는 않습니다.
 `--readme-url README.md`로 같은 폴더의 문서를 가리키게 할 수도 있습니다.
-추가 링크 변경은 `--link script=URL`, `--link farm=URL`로 지정합니다.
+Bash 다운로드 링크 변경은 `--link farm=URL`로 지정합니다.
 
 다른 HTML에서도 `<img data-image="키" alt="설명">`,
 `<a data-link="키" href="기존주소">문구</a>`를 넣고 같은 스크립트를 쓸 수 있습니다.
