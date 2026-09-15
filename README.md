@@ -19,6 +19,72 @@ GNU 호환 `addr2line`을 우선 사용합니다. 자동 탐색으로도 찾지 
 실행 시간, 캐시 hit/miss는 추정하지 않습니다.** Interrupt handler의 명령어도
 해당 PC의 함수/소스에 직접 귀속되므로 호출 스택 복원이 필요하지 않습니다.
 
+## INTRO 가이드의 이미지·내부망 링크 설정
+
+`INTRO.html`은 한국어/영어 사용 가이드입니다. Overview → Convert → Select & Merge →
+Results 순서이며, Results에는 Performance Profiler의 Settings, Overview,
+Sources / Functions 탭이 있습니다.
+
+폐쇄망에서 캡처한 이미지를 다음과 같이 HTML 내부에 삽입할 수 있습니다.
+`bundle_html.py`는 Python 3.6.8 이상에서 추가 패키지 없이 실행됩니다.
+
+```bash
+python3 bundle_html.py INTRO.html -o INTRO_internal.html \
+  --image tarmac=/work/screens/tarmac.png \
+  --image cachegrind=/work/screens/result.png \
+  --image settings=/work/screens/settings.png \
+  --image overview=/work/screens/overview.png \
+  --image sources=/work/screens/sources.png \
+  --github-url https://github.internal/team/tarmac_to_cachegrind \
+  --readme-url https://github.internal/team/tarmac_to_cachegrind/blob/main/README.md \
+  --profiler-url https://github.internal/team/performance_profiler
+```
+
+주소는 실제 내부망 주소로 바꾸세요. 이미지/링크 옵션은 필요한 것만 지정하면 됩니다.
+PNG, JPEG, GIF, WebP를 base64로 내장하므로 **이미지 확인에는 결과 HTML 한 파일만**
+필요합니다. 이미지가 없으면 위치 안내가 표시됩니다. 다운로드 링크의 Python/Bash 파일은
+HTML에 포함되지 않습니다. 링크를 누르려면 해당 파일을 함께 배포하거나 링크를 변경하세요.
+외부 Valgrind 문서 링크는 인터넷 접근이 가능한 환경에서 열 수 있습니다.
+
+GitHub와 README는 별도 링크입니다. 브랜치나 문서 위치를 추측하지 않으므로
+`--github-url`만 지정해도 README 주소가 자동으로 바뀌지는 않습니다.
+`--readme-url README.md`로 같은 폴더의 문서를 가리키게 할 수도 있습니다.
+추가 링크 변경은 `--link script=URL`, `--link farm=URL`로 지정합니다.
+
+다른 HTML에서도 `<img data-image="키" alt="설명">`,
+`<a data-link="키" href="기존주소">문구</a>`를 넣고 같은 스크립트를 쓸 수 있습니다.
+`--image 키=로컬경로`, `--link 키=주소`는 반복 지정할 수 있습니다.
+경로에 공백이 있으면 명령줄의 `키=경로` 전체를 따옴표로 감싸세요.
+입력 이미지 경로는 현재 작업 폴더 기준입니다.
+
+```bash
+python3 bundle_html.py INTRO.html --list-slots
+python3 bundle_html.py other.html -o bundled.html \
+  --image 'example=/work/screens/example image.png' --link docs=manual.html
+```
+
+입력 HTML과 `-o`를 같은 경로로 지정하면 제자리 갱신도 가능합니다. 지정하지 않은 이미지와
+링크는 유지하며, 잘못된 키/이미지/링크는 출력 교체 전에 오류로 처리합니다.
+
+## Compute Farm에서 실행
+
+내부망에서는 `--workers`에 필요한 CPU 자원을 Compute Farm을 통해 할당받아야 합니다.
+`run_compute_farm.sh`와 `tarmac_to_cachegrind.py`를 같은 폴더에 두고 실행하세요.
+래퍼는 `ud python3 /스크립트경로/tarmac_to_cachegrind.py ...`로 실행하며 Python 옵션을
+그대로 전달합니다. `ud`가 설치되어 PATH에서 실행 가능한 내부망 환경이 필요합니다.
+
+```bash
+bash run_compute_farm.sh /work/tests \
+  --elf /work/cm4.elf --log-name tarmac_cm4.log \
+  --objdump arm-none-eabi-objdump --workers 16 \
+  --progress-stream stdout -o /work/coverage
+```
+
+다른 Python/스크립트 경로가 필요하면 `TARMAC_PYTHON`, `TARMAC_SCRIPT` 환경변수를
+지정하세요. 래퍼는 자원 요청 옵션을 임의로 추가하지 않으므로 실제 CPU 할당량은
+내부 `ud`/Compute Farm 설정을 따릅니다. 외부 환경의 검증에는 가짜 `ud`를 사용해
+인자·공백·종료 코드 전달을 확인했습니다. 실제 farm 접속은 내부망에서 확인해야 합니다.
+
 ## 요구사항
 
 - Python 3.6.8 이상. `pip install` 불필요.
@@ -691,7 +757,7 @@ gzip -dc core0.log.gz | python3 tarmac_to_cachegrind.py - --elf core0.elf -o cac
 python3 -m unittest discover -s tests -v
 ```
 
-Python 3.6.8 및 3.12.14 인터프리터에서 아래 62개 테스트의 통과를 확인했습니다.
+Python 3.6.8 및 3.12.14 인터프리터에서 아래 66개 테스트의 통과를 확인했습니다.
 `dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,
