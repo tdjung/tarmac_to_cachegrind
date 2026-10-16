@@ -608,8 +608,8 @@ timestamp는 정수이며 생략할 수 있습니다. 단위는 `tic`, `ps`, `ns
 |---|---|
 | 정상 `ES`, `IT` | 해당 PC의 `Ir`에 1 추가 |
 | `IF` | 같은 cycle에 folded된 명령어도 1 추가 |
-| `IS` | 조건 불충족이므로 제외 |
-| `ES ... CCFAIL ...` | 조건 불충족이므로 제외 |
+| `IS` | 조건 불충족이므로 `Ir`에서 제외. branch 위치라면 fall로 집계 |
+| `ES ... CCFAIL ...` | 조건 불충족이므로 `Ir`에서 제외. branch 위치라면 fall로 집계 |
 | `ES EXC ...` | 예외 이벤트로 집계하고 `Ir`에서 제외 |
 | 인코딩이 `--------`, `....` 등인 레코드 | fetch 실패/알 수 없는 인코딩으로 제외 |
 | `R`, `BR`, `E`, `BNR...`, `MNR...`, `LD`, `ST` 등 | 실행 명령어가 아니므로 제외 |
@@ -663,8 +663,8 @@ ELF 조회에는 `PC - load_offset`을 사용합니다. 함수의 비용은
 
 **coverage의 범위는 ELF에 남아 있고 소스 라인으로 매핑 가능한 명령어입니다.**
 최적화/링커에 의해 제거된 코드, 주석, 빈 줄은 0인 실행 가능 라인으로 추가하지 않습니다.
-PC별 실행 여부를 확인할 수 있지만, 이 값만으로 완전한 branch/condition coverage를
-나타내지는 않습니다.
+PC별 실행 여부만으로는 조건 분기의 양쪽이 모두 실행됐는지 알 수 없습니다. 분기별
+jump/fall 여부는 아래 [Branch coverage](#branch-coverage)의 `Bs Bj Bf` 이벤트로 기록합니다.
 
 CSV에도 미실행 PC를 `Ir=0`으로 포함합니다. JSON의 `unique_pcs`는 trace에서 실제로
 실행된 고유 PC 수이고, `elf_instruction_pcs`는 objdump에서 수집한 고유 명령어 주소
@@ -714,6 +714,117 @@ fallback에서는 디스어셈블의 함수 심볼과 파일/라인 표기를 �
 오류로 처리합니다. 자동 전환은 **옵션을 생략했고 자동 탐색에서도 찾지 못했을 때만**
 발생합니다. objdump까지 없거나 실행에 실패하면 변환을 중단합니다.
 
+## Branch coverage
+
+기본 모드(ELF 전체를 objdump로 분석하는 모드)에서는 조건 분기마다 양쪽 결과가 실행됐는지
+함께 기록합니다. 대상은 Cortex-M4(ARMv7E-M)와 Cortex-M35P(ARMv8-M Mainline)의
+Thumb/Thumb-2 명령어입니다. 추가 옵션은 필요 없습니다.
+
+```text
+events: Ir Bs Bj Bf
+fl=src/uart.c
+fn=uart_rx
+jcnd=3/15 0x80ca 25
+0x80b2 23
+0x80b2 23 4 1 3 12
+```
+
+| 이벤트 | 의미 |
+|---|---|
+| `Bs` | 조건 분기 위치이면 1. 한 번도 실행되지 않은 분기도 1로 기록하므로 coverage의 분모가 됩니다 |
+| `Bj` | 분기 대상(jump target)으로 간 횟수 |
+| `Bf` | 다음 명령어(fallthrough)로 간 횟수. 조건 실패(`CCFAIL`, `IS`)를 포함합니다 |
+
+분기 위치의 양쪽이 모두 커버되려면 `Bj > 0`이고 `Bf > 0`이어야 합니다. 여러 프로파일을
+합산해도 `> 0` 판정은 그대로 유지되므로, 뷰어나 `--merge-list`에서 합산해도 의미가 깨지지
+않습니다. 분기가 아닌 행은 뒤쪽 0을 생략하고 `Ir`만 기록합니다(callgrind 형식에서 생략된
+비용은 0입니다).
+
+대상이 고정된 분기 앞에는 callgrind 표준 `jcnd=<jump 횟수>/<실행 횟수> <대상 PC> <대상 라인>`
+레코드와 위치만 있는 줄을 둡니다. 뷰어는 이 정보로 누락된 쪽의 도착 위치를 화살표로
+그릴 수 있습니다. 그다음 줄이 실제 비용 행입니다.
+
+ELF에 조건 분기가 하나도 없으면 기존과 같은 `events: Ir` 형식을 출력합니다.
+`--no-branch`를 지정해도 기존 형식이 됩니다. `--executed-only`에서는 실행되지 않은 분기를
+분모에 넣을 수 없으므로 branch coverage를 기록하지 않습니다.
+
+### 분기로 인식하는 명령어
+
+| 명령어 | 분류 |
+|---|---|
+| `b<cc>` (`.n`/`.w`) | 대상이 고정된 조건 분기 |
+| `cbz`, `cbnz` | 대상이 고정된 조건 분기 |
+| IT 블록 안의 `bl<cc>` | 조건부 호출 |
+| IT 블록 안의 `bx<cc>`, `bxns<cc>`, `pop<cc> {..., pc}`, `ldm<cc> {..., pc}`, `ldr<cc> pc, ...`, `mov<cc> pc, ...` | 대상이 고정되지 않은 조건 분기(조건부 return) |
+| IT 블록 안의 `blx<cc>`, `blxns<cc>` | 대상이 고정되지 않은 조건부 호출 |
+
+분기 위치와 대상, fallthrough 주소는 objdump 출력에서 얻습니다. GNU
+`arm-none-eabi-objdump`와 `llvm-objdump`의 출력 형식을 모두 지원하며 두 도구의 결과가
+같음을 테스트로 확인합니다.
+
+### 결과 판정
+
+trace를 읽으면서 분기 위치 바로 다음에 PC가 있는 명령어 레코드를 보고 판정합니다.
+
+| 다음 레코드 | 판정 |
+|---|---|
+| 분기 위치 자체의 `CCFAIL`/`IS` | fall |
+| 대상 PC | jump |
+| fallthrough PC | fall |
+| 같은 PC의 반복 레코드(예: `IT` 뒤 `IF`) | 무시하고 다음 레코드로 판정 |
+| 대상이 없는 분기에서 fallthrough가 아닌 PC | jump. 단, return 계열 분기 뒤 함수 시작 주소는 예외 진입으로 보고 미판정 |
+| `ES EXC`, 그 밖의 PC, trace 끝 | 미판정(unresolved) |
+
+다음 PC로 판정하므로 `CCFAIL`을 표시하지 않는 ES 생성기에서도 결과가 같습니다.
+**미판정은 커버로 세지 않습니다.** 분기 직후에 인터럽트가 들어오면 그 실행은 빠지므로
+실제로는 실행된 쪽이 미커버로 보일 수는 있지만, 실행되지 않은 쪽이 커버로 보이지는
+않습니다. 미판정 건수는 `--stats`와 `batch_report.json`의 `branch_unresolved`에 기록됩니다.
+
+IT 형식 trace에는 예외 진입 레코드가 없습니다. 그래서 조건부 간접 호출(`blx<cc>`) 직후의
+인터럽트는 jump로 셀 수 있습니다. 이 조합은 드물어 별도로 처리하지 않습니다.
+
+### 분기 없는 조건부 명령어
+
+컴파일러는 조건문을 분기 없이 IT 블록(`it ge; movge r0, r2`)으로 만들기도 합니다.
+`-O2`로 빌드한 테스트 펌웨어에서는 조건부 명령어 29개 중 10개가 분기가 아닌 IT 블록
+명령어였습니다. 이 명령어는
+branch coverage에 포함하지 않으며 `Ir`/code coverage로 확인합니다. 조건이 실패한 실행은
+`Ir`에서 빠지므로, 조건이 한 번도 참이 아니었다면 그 라인은 미실행으로 보입니다.
+개수는 stats의 `conditional_nonbranch_instructions`와, 한쪽 결과만 나온 수
+`conditional_nonbranch_one_sided`로 확인할 수 있습니다.
+
+### Stats 항목
+
+| 항목 | 의미 |
+|---|---|
+| `branch_sites` | ELF의 조건 분기 위치 수 |
+| `branch_sites_executed` | 한 번 이상 판정된 분기 위치 수 |
+| `branch_outcomes_covered` | 커버된 결과 수(최대 `2 × branch_sites`) |
+| `branch_unresolved` | 판정하지 못한 분기 실행 수 |
+| `conditional_nonbranch_instructions` | IT 블록 안의 분기 아닌 조건부 명령어 수 |
+| `conditional_nonbranch_one_sided` | 그중 실행·조건 실패 중 한쪽만 나온 수 |
+
+### 처리 비용
+
+분기 판정을 위해 trace 해석 시간이 약 15% 늘어납니다(549,000줄 기준). `--no-branch`에서는
+기존과 같습니다. ELF 분석은 기존 objdump 실행 결과를 그대로 사용하므로 추가 실행이 없습니다.
+
+### 실제 실행 기반 검증
+
+`tests/firmware`에는 두 코어용으로 빌드한 테스트 펌웨어와, QEMU로 실행해 만든 trace가
+있습니다. QEMU에는 Cortex-M35P 모델이 없어 같은 명령어 집합(ARMv8-M Mainline)인
+Cortex-M33(`mps2-an505`)에서 실행합니다. `qemu_to_tarmac.py`는 실행 기록을 ES(CCFAIL
+포함/미포함)와 IT(IS 포함, IF 중복 포함) 네 가지 형식으로 쓰고, 각 분기의 정답을 다음 PC가
+아닌 **CPU 플래그로 조건을 평가해** 기록합니다. 테스트는 변환기 결과가 정답보다 많지 않고,
+커버 여부가 정확히 같으며, 부족분이 미판정 건수와 같은지 확인합니다.
+
+```bash
+cd tests/firmware
+./build.sh                                   # arm-none-eabi-gcc 필요
+python3 qemu_to_tarmac.py branchy_m4.elf m4 traces     # qemu-system-arm 필요
+python3 qemu_to_tarmac.py branchy_m35p.elf m35p traces
+```
+
 ## 진단 및 추가 옵션
 
 ```bash
@@ -758,6 +869,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 Python 3.6.8 및 3.12.14 인터프리터에서 아래 66개 테스트의 통과를 확인했습니다.
+branch coverage 테스트 22개를 더한 88개는 Python 3.13에서 확인했습니다.
 `dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,
@@ -783,6 +895,11 @@ Python 3.6.8 및 3.12.14 인터프리터에서 아래 66개 테스트의 통과�
   재번호 부여, 큰 번호의 밀집 비트마스크, ELF/매핑/summary 오류 및 기존 출력 보존을 검증합니다.
   800개 개별 출력의 재merge total이 최초 배치 total과 바이트 단위로 일치함을 확인합니다.
 - 반복 해석 캐시가 CCFAIL·fetch 실패·IS/IF·malformed 및 실행 횟수를 보존하는지 검증합니다.
+- Branch coverage: 조건 분기 명령어 분류, GNU/LLVM objdump 결과 일치, IT 블록 처리,
+  다음 PC 판정 규칙(CCFAIL/IS, IF 중복, 예외, trace 끝, 간접 분기), Cortex-M4/M35P 실제 실행
+  trace 4종의 정답 비교, 출력 형식, `--no-branch`/`--executed-only`, 배치 total과
+  `--merge-list` 결과 일치, 혼합/변조 프로파일 거부를 검증합니다. Arm용 objdump/addr2line이
+  없으면 해당 테스트는 skip됩니다.
 
 ELF 통합 테스트에는 `gcc`, `nm`, `addr2line`, `objdump`가 필요하며 없으면 해당 테스트가
 skip됩니다. 테스트는 호스트에서 컴파일한 ELF 주소에 합성 Tarmac 이벤트를 연결하는

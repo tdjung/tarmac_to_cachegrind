@@ -46,19 +46,25 @@ IT_PAREN_PC = re.compile(
 LOCATION = re.compile(r"^(.*):(\d+|\?)(?:\s+\(discriminator \d+\))?$")
 EXCEPTION = re.compile(r"EXC\b")
 CCFAIL = re.compile(r"\bCCFAIL\b")
+LISTING = re.compile(r"^\s*([0-9a-fA-F]+):\s+(\S+)(?:\s+(.*))?$")
 
 
 def decode_instruction(event, body):
-    """Return (PC, disposition); caching includes the entire body, including flags."""
+    """Return (PC, disposition); caching includes the entire body, including flags.
+
+    Condition-failed records (IS, ES ... CCFAIL) keep their PC: they are not
+    counted as executed, but branch outcome tracking needs to see them.
+    """
     if event == "ES" and EXCEPTION.match(body):
         return None, "exceptions"
-    if event == "IS":
-        return None, "conditional_skipped"
     match = ES.match(body) if event == "ES" else (IT.match(body) or IT_PAREN_PC.match(body))
+    if event == "IS":
+        # Condition failed. Its PC still matters for branch outcomes.
+        return (int(match.group("pc"), 16) if match else None), "conditional_skipped"
     if match is None:
         return None, "malformed"
     if event == "ES" and CCFAIL.search(match.group("tail")):
-        return None, "conditional_skipped"
+        return int(match.group("pc"), 16), "conditional_skipped"
     if match.group("opcode")[0] in "-.":
         return None, "fetch_failed"
     return int(match.group("pc"), 16), None
@@ -82,6 +88,12 @@ class Stats:
         self.unknown_source_instructions = 0
         self.events = {}  # type: Dict[str, int]
         self.elf_instruction_pcs = 0
+        self.branch_sites = 0
+        self.branch_sites_executed = 0
+        self.branch_outcomes_covered = 0
+        self.branch_unresolved = 0
+        self.conditional_nonbranch_instructions = 0
+        self.conditional_nonbranch_one_sided = 0
 
 
 class Source(namedtuple("SourceBase", "file function line")):
@@ -95,12 +107,19 @@ class Source(namedtuple("SourceBase", "file function line")):
 
 def count_pcs(
     lines: Iterable[str], *, input_format: str = "auto", skip_malformed: bool = False,
-    allow_empty: bool = False
+    allow_empty: bool = False, outcomes: Optional["BranchOutcomes"] = None
 ) -> Tuple[CounterType[int], Stats]:
     """Stream the trace; retain only a histogram of unique instruction PCs.
 
     No timestamp-based deduplication: folded and same-cycle instructions count
     independently. ES without CCFAIL is assumed executed (see README limits).
+
+    With `outcomes`, each conditional branch site is resolved from the next
+    instruction record that carries a PC (executed or condition-failed):
+    the jump target means taken, the fallthrough means not taken, and a
+    condition-failed record at the site itself means not taken. A repeated
+    record at the site's own PC (e.g. IF after IT) is ignored. Anything else,
+    an intervening ES EXC, or the end of the trace leaves it unresolved.
     """
     counts: CounterType[int] = Counter()
     stats = Stats()
@@ -108,6 +127,8 @@ def count_pcs(
     # or cross-thread mutation. Cache hits still count every occurrence.
     decode = lru_cache(maxsize=8192)(decode_instruction)
     event_matcher = EVENT.match
+    sites_get = outcomes.sites.get if outcomes is not None and outcomes.sites else None
+    pending = None  # BranchSite whose successor has not been seen yet
     for line_number, line in enumerate(lines, 1):
         stats.lines += 1
         # Most register/memory records cannot possibly match EVENT. This filter
@@ -137,10 +158,44 @@ def count_pcs(
                     "check the trace dialect, or use --skip-malformed to omit it"
                 )
             continue
+        if sites_get is not None:
+            if disposition == "exceptions":
+                if pending is not None:
+                    outcomes.unresolved += 1
+                    pending = None
+            elif pc is not None:
+                if pending is not None:
+                    if pc == pending.target:
+                        outcomes.jump[pending.pc] += 1
+                        pending = None
+                    elif pc == pending.fallthrough:
+                        outcomes.fall[pending.pc] += 1
+                        pending = None
+                    elif pc != pending.pc:
+                        # Indirect sites have no static target: any successor
+                        # but the fallthrough is the jump, except a function
+                        # entry after a return-type site, which is where an
+                        # exception lands (IT traces do not show EXC records).
+                        if (pending.target is None and pending.fallthrough is not None and
+                                (pending.kind == "indirect_call" or pc not in outcomes.entries)):
+                            outcomes.jump[pending.pc] += 1
+                        else:
+                            outcomes.unresolved += 1
+                        pending = None
+                site = sites_get(pc)
+                if site is not None:
+                    if disposition:
+                        outcomes.fall[pc] += 1
+                    elif pending is None:
+                        pending = site
+                elif disposition and pc in outcomes.conditional:
+                    outcomes.conditional_skipped[pc] += 1
         if disposition:
             continue
         counts[pc] += 1
         stats.instructions += 1
+    if pending is not None:
+        outcomes.unresolved += 1
     stats.unique_pcs = len(counts)
     if not counts and not allow_empty:
         raise ConversionError(
@@ -233,15 +288,29 @@ def find_objdump(explicit: Optional[str], addr2line: Optional[str]) -> str:
     raise ConversionError("objdump not found; pass --objdump /path/to/arm-none-eabi-objdump")
 
 
+# llvm-objdump prints raw bytes before data directives even with
+# --no-show-raw-insn: `10c: 50 02 00 00 .word 0x00000250`.
+RAW_DATA = re.compile(r"^(?:[0-9a-fA-F]{2}\s+)+\.")
+
+
+def is_data(mnemonic: str, rest: str) -> bool:
+    """True for listing lines that are data, not instruction starts.
+
+    GNU objdump shows data in a code section as `.word`, or (without mapping
+    symbols, e.g. a vector table) as a 16-column ASCII dump such as
+    `A...A...A.......`; llvm-objdump prefixes `.word` with raw bytes.
+    """
+    return (mnemonic.startswith(".") or mnemonic in ("(bad)", "<unknown>") or
+            (not rest and (".." in mnemonic or len(mnemonic) == 16)) or
+            bool(RAW_DATA.match(mnemonic + " " + rest)))
+
+
 def instruction_pcs(disassembly: str):
     """Read instruction starts, excluding ARM mapping-symbol data directives."""
     pcs = set()
     for line in disassembly.splitlines():
-        match = re.match(r"^\s*([0-9a-fA-F]+):\s+(\S+)", line)
-        if not match:
-            continue
-        mnemonic = match.group(2)
-        if mnemonic.startswith(".") or mnemonic in ("(bad)", "<unknown>"):
+        match = LISTING.match(line)
+        if not match or is_data(match.group(2), match.group(3) or ""):
             continue
         pcs.add(int(match.group(1), 16))
     return pcs
@@ -293,6 +362,139 @@ def objdump_sources(disassembly: str) -> Dict[int, Source]:
     return sources
 
 
+# --- Conditional branch analysis (Cortex-M Thumb/Thumb-2: v7E-M and v8-M) ---
+#
+# A branch site is an instruction whose condition decides between two
+# successors: the jump target and the fallthrough (next instruction). Branch
+# coverage counts, per site, whether each successor was ever taken.
+CONDITION = r"(?:eq|ne|cs|hs|cc|lo|mi|pl|vs|vc|hi|ls|ge|lt|gt|le)"
+WIDTH = r"(?:\.[nw])?"
+DIRECT_BRANCH = re.compile(rf"^(?:b|bl){CONDITION}{WIDTH}$")
+PLAIN_BRANCH = re.compile(rf"^b{CONDITION}{WIDTH}$")
+COMPARE_BRANCH = re.compile(rf"^cbn?z{WIDTH}$")
+INDIRECT_BRANCH = re.compile(rf"^(?:bx|bxns){CONDITION}{WIDTH}$")
+INDIRECT_CALL = re.compile(rf"^(?:blx|blxns){CONDITION}{WIDTH}$")
+PC_LIST_LOAD = re.compile(rf"^(?:pop|ldm|ldmia|ldmfd|ldmdb|ldmea){CONDITION}{WIDTH}$")
+PC_DEST = re.compile(rf"^(?:ldr|mov){CONDITION}{WIDTH}$")
+IT_BLOCK = re.compile(r"^it[te]{0,3}$")
+
+BranchSite = namedtuple("BranchSite", "pc target fallthrough kind")
+SYMBOL = re.compile(r"^([0-9a-fA-F]+) <[^>]+>:$")
+
+
+def branch_target(operands: str) -> Optional[int]:
+    """Absolute target of a direct branch: GNU `ac <f+0xc>` or LLVM `0xac <f+0xc>`."""
+    text = operands.split("<", 1)[0].split("@", 1)[0].split(";", 1)[0]
+    token = text.split(",")[-1].strip()
+    if not token or token.startswith("#"):
+        return None
+    try:
+        return int(token, 16)
+    except ValueError:
+        return None  # a register: indirect
+
+
+def classify_branch(mnemonic: str, operands: str):
+    """Return (kind, target) for a conditional branch, else None."""
+    mnemonic = mnemonic.lower()
+    if DIRECT_BRANCH.match(mnemonic):
+        target = branch_target(operands)
+        return ("bcc" if PLAIN_BRANCH.match(mnemonic) else "call"), target
+    if COMPARE_BRANCH.match(mnemonic):
+        return "cbz", branch_target(operands)
+    if INDIRECT_CALL.match(mnemonic):
+        return "indirect_call", None
+    if INDIRECT_BRANCH.match(mnemonic):
+        return "indirect", None
+    lowered = operands.lower()
+    if PC_LIST_LOAD.match(mnemonic) and re.search(r"\bpc\b", lowered.split("{", 1)[-1]):
+        return "indirect", None
+    if PC_DEST.match(mnemonic) and lowered.split(",", 1)[0].strip() == "pc":
+        return "indirect", None
+    return None
+
+
+BranchAnalysis = namedtuple("BranchAnalysis", "sites conditional entries")
+
+
+def analyze_branches(disassembly: str, load_offset: int = 0) -> BranchAnalysis:
+    """Find conditional branch sites and branchless conditional instructions.
+
+    Returns BranchAnalysis(sites={runtime_pc: BranchSite}, conditional=
+    frozenset of conditional non-branch instructions inside IT blocks,
+    entries=frozenset of symbol start addresses). Addresses are ELF addresses
+    plus load_offset. The fallthrough is the next listed address, so literal
+    data after a branch is still a valid boundary.
+    """
+    sites = {}  # type: Dict[int, BranchSite]
+    conditional = set()
+    entries = set()
+    pending = []  # [elf_pc, kind, target] waiting for the next address
+    it_remaining = 0
+    for raw in disassembly.splitlines():
+        if raw.startswith("Disassembly of section "):
+            pending, it_remaining = [], 0
+            continue
+        match = LISTING.match(raw)
+        if not match:
+            symbol = SYMBOL.match(raw.strip())
+            if symbol:
+                entries.add(int(symbol.group(1), 16) + load_offset)
+            continue
+        pc = int(match.group(1), 16)
+        mnemonic, operands = match.group(2), match.group(3) or ""
+        for site_pc, kind, target in pending:
+            sites[site_pc + load_offset] = BranchSite(
+                site_pc + load_offset,
+                None if target is None else target + load_offset,
+                pc + load_offset, kind)
+        pending = []
+        if is_data(mnemonic, operands):
+            it_remaining = 0
+            continue
+        found = classify_branch(mnemonic, operands)
+        if found:
+            pending.append((pc, found[0], found[1]))
+        elif it_remaining:
+            conditional.add(pc + load_offset)
+        if it_remaining:
+            it_remaining -= 1
+        if IT_BLOCK.match(mnemonic.lower()):
+            it_remaining = len(mnemonic) - 1
+    for site_pc, kind, target in pending:
+        # Last instruction in the listing: no known fallthrough.
+        sites[site_pc + load_offset] = BranchSite(
+            site_pc + load_offset, None if target is None else target + load_offset, None, kind)
+    return BranchAnalysis(sites, frozenset(conditional), frozenset(entries))
+
+
+class BranchOutcomes:
+    """Per-trace jump/fall counters, filled while the trace is streamed."""
+
+    def __init__(self, analysis: Optional[BranchAnalysis] = None):
+        self.sites = analysis.sites if analysis else {}
+        self.conditional = analysis.conditional if analysis else frozenset()
+        self.entries = analysis.entries if analysis else frozenset()
+        self.jump = Counter()  # type: CounterType[int]
+        self.fall = Counter()  # type: CounterType[int]
+        self.conditional_skipped = Counter()  # type: CounterType[int]
+        self.unresolved = 0
+
+    def finish(self, counts, stats):
+        stats.branch_sites = len(self.sites)
+        stats.branch_sites_executed = len(set(self.jump) | set(self.fall))
+        stats.branch_outcomes_covered = (sum(1 for v in self.jump.values() if v) +
+                                         sum(1 for v in self.fall.values() if v))
+        stats.branch_unresolved = self.unresolved
+        stats.conditional_nonbranch_instructions = len(self.conditional)
+        one_sided = 0
+        for pc in self.conditional:
+            executed, skipped = counts.get(pc, 0), self.conditional_skipped.get(pc, 0)
+            if (executed or skipped) and not (executed and skipped):
+                one_sided += 1
+        stats.conditional_nonbranch_one_sided = one_sided
+
+
 def seed_pcs(counts: CounterType[int], pcs: Iterable[int], load_offset: int) -> int:
     pcs = set(pcs)
     if not pcs:
@@ -330,19 +532,82 @@ def one_line(value: str) -> str:
     return value.replace("\r", " ").replace("\n", " ")
 
 
-def write_cachegrind(out: TextIO, costs: CounterType[Position], elf: Path) -> None:
+BRANCH_EVENTS = "Bs Bj Bf"
+BRANCH_SEMANTICS = (
+    "Bs=1 marks a conditional branch site (summed when profiles merge; >0 means site); "
+    "Bj/Bf count jumps to the target and falls to the next instruction, summed over tests; "
+    "a site is fully covered when Bj>0 and Bf>0; jcnd= gives jumped/executed and the target")
+
+
+class BranchCounts(namedtuple("BranchCountsBase", "targets jump fall")):
+    """What a profile needs to say about branches.
+
+    targets maps every branch site PC to its jump target PC (None for
+    indirect sites); jump/fall count how often each successor was reached.
+    Sites with no counts are still listed: they are the coverage denominator.
+    """
+
+    __slots__ = ()
+
+    @classmethod
+    def empty(cls, targets):
+        return cls(dict(targets), Counter(), Counter())
+
+    def add(self, jump, fall):
+        self.jump.update(jump)
+        self.fall.update(fall)
+
+    def summary(self):
+        return " {} {} {}".format(len(self.targets), sum(self.jump.values()), sum(self.fall.values()))
+
+
+def branch_targets(analysis):
+    """Site PC -> jump target, from a BranchAnalysis or BranchOutcomes."""
+    return {pc: site.target for pc, site in analysis.sites.items()} if analysis else {}
+
+
+def branch_row(prefix, pc, branch, target_line):
+    """Split a layout prefix and return (text before costs, branch cost suffix).
+
+    The site's cost row carries Bs=1 and its jump/fall counts. A direct site
+    is preceded by `jcnd=<jumped>/<executed> <target pc> <target line>` and a
+    position-only line: callgrind readers take the line after jcnd= as the
+    jump's source position, never as costs, so the real cost row follows it.
+    """
+    split = prefix.rfind("\n") + 1
+    head, position = prefix[:split], prefix[split:]
+    jump, fall = branch.jump.get(pc, 0), branch.fall.get(pc, 0)
+    target = branch.targets[pc]
+    if target is not None:
+        head += "jcnd={}/{} 0x{:x} {}\n{}\n".format(jump, jump + fall, target, target_line(target),
+                                                    position.rstrip())
+    return head + position, " 1 {} {}".format(jump, fall)
+
+
+def write_cachegrind(out: TextIO, costs: CounterType[Position], elf: Path,
+                     branch: Optional[BranchCounts] = None) -> None:
     """Write the requested instruction-address and source-line profile format."""
-    out.write("# callgrind format\npositions: instr line\nevents: Ir\n")
+    branch = branch if branch and branch.targets else None
+    out.write("# callgrind format\npositions: instr line\nevents: Ir{}\n".format(
+        " " + BRANCH_EVENTS if branch else ""))
     out.write("ob: " + json.dumps(str(elf), ensure_ascii=False) + "\n")
+    lines = {position.pc: position.line for position in costs}
+    target_line = lambda pc: lines.get(pc, 0)
     previous = None
     for source in sorted(costs, key=lambda s: (s.file, s.function, s.pc, s.line)):
         key = (source.file, source.function)
+        prefix = ""
         if key != previous:
             # Every fl is immediately followed by fn, as Cachegrind requires.
-            out.write(f"fl={one_line(source.file)}\nfn={one_line(source.function)}\n")
+            prefix = f"fl={one_line(source.file)}\nfn={one_line(source.function)}\n"
             previous = key
-        out.write(f"0x{source.pc:x} {source.line} {costs[source]}\n")
-    out.write(f"summary: {sum(costs.values())}\n")
+        prefix += f"0x{source.pc:x} {source.line} "
+        if branch and source.pc in branch.targets:
+            text, suffix = branch_row(prefix, source.pc, branch, target_line)
+            out.write(f"{text}{costs[source]}{suffix}\n")
+        else:
+            out.write(f"{prefix}{costs[source]}\n")
+    out.write("summary: {}{}\n".format(sum(costs.values()), branch.summary() if branch else ""))
 
 
 @contextmanager
@@ -395,6 +660,8 @@ def log_basename(value):
 class ProfileContext:
     """Keep ELF instruction/source analysis and unknown-PC results across logs."""
 
+    branch = None  # BranchAnalysis with at least one site, or None
+
     def __init__(self, args):
         self.elf = args.elf
         self.offset = args.load_offset
@@ -414,6 +681,9 @@ class ProfileContext:
                 pcs = instruction_pcs(dump)
             if not pcs:
                 raise ConversionError("objdump found no executable instructions in the ELF")
+            if not args.executed_only and not getattr(args, "no_branch", False):
+                analysis = analyze_branches(dump, self.offset)
+                self.branch = analysis if analysis.sites else None
             if not args.executed_only:
                 runtime = Counter()
                 self.elf_pc_count = seed_pcs(runtime, pcs, self.offset)
@@ -454,14 +724,28 @@ class ProfileContext:
                   if pc not in self.baseline_pcs]
         return self.make_layout(list(self.baseline) + extras) if extras else self.layout
 
-    def write(self, out, counts):
+    def target_line(self, pc):
+        return self.sources.get(pc, Source()).line
+
+    def write(self, out, counts, branch=None):
         layout = self.output_layout(counts)
-        out.write("# callgrind format\npositions: instr line\nevents: Ir\n")
+        branch = branch if branch and branch.targets else None
+        out.write("# callgrind format\npositions: instr line\nevents: Ir{}\n".format(
+            " " + BRANCH_EVENTS if branch else ""))
         out.write("ob: " + json.dumps(str(self.elf), ensure_ascii=False) + "\n")
         get = counts.get
-        out.writelines(prefix + str(get(pc)) + "\n" if get(pc, 0) else zero
-                       for pc, prefix, zero in layout)
-        out.write("summary: {}\n".format(sum(counts.values())))
+        if branch is None:
+            out.writelines(prefix + str(get(pc)) + "\n" if get(pc, 0) else zero
+                           for pc, prefix, zero in layout)
+        else:
+            sites = branch.targets
+            for pc, prefix, zero in layout:
+                if pc in sites:
+                    text, suffix = branch_row(prefix, pc, branch, self.target_line)
+                    out.write(text + str(get(pc, 0)) + suffix + "\n")
+                else:
+                    out.write(prefix + str(get(pc)) + "\n" if get(pc, 0) else zero)
+        out.write("summary: {}{}\n".format(sum(counts.values()), branch.summary() if branch else ""))
 
     def resolve(self, pcs):
         missing = set(pcs).difference(self.sources)
@@ -575,8 +859,9 @@ class CoverageIndex:
     def line_key(pc, source):
         return (source.file, source.line) if source.file != "???" and source.line > 0 else (None, pc)
 
-    def write(self, out, context, counts):
+    def write(self, out, context, counts, branch=None):
         layout = context.output_layout(counts)
+        branch = branch if branch and branch.targets else None
         anchors, line_masks = {}, {}
         for pc, _, _ in layout:
             if counts.get(pc, 0) > 0:
@@ -584,7 +869,7 @@ class CoverageIndex:
                 anchors.setdefault(key, pc)
                 line_masks[key] = line_masks.get(key, 0) | self.pc_masks.get(pc, 0)
         out.write("# callgrind format\npositions: instr line\nevents: Ir " +
-                  " ".join(COVERAGE_EVENTS) + "\n")
+                  " ".join(COVERAGE_EVENTS) + (" " + BRANCH_EVENTS if branch else "") + "\n")
         out.write("ob: " + json.dumps(str(context.elf), ensure_ascii=False) + "\n")
         summary = [sum(counts.values())] + [0] * len(COVERAGE_EVENTS)
         zero = " 0" * len(COVERAGE_EVENTS) + "\n"
@@ -596,8 +881,13 @@ class CoverageIndex:
                 values, suffix = self.row(line_masks[key])
                 for i, value in enumerate(values, 1):
                     summary[i] += value
-            out.write(prefix + str(count) + suffix)
-        out.write("summary: " + " ".join(map(str, summary)) + "\n")
+            if branch is not None and pc in branch.targets:
+                text, branch_suffix = branch_row(prefix, pc, branch, context.target_line)
+                out.write(text + str(count) + suffix[:-1] + branch_suffix + "\n")
+            else:
+                out.write(prefix + str(count) + suffix)
+        out.write("summary: " + " ".join(map(str, summary)) +
+                  (branch.summary() if branch else "") + "\n")
 
 
 _WORKER_CONTEXT = None
@@ -617,24 +907,31 @@ def convert_batch_file(task, context=None, args=None):
     started = time.monotonic()
     try:
         opener = gzip.open if path.name.endswith(".gz") else open
+        outcomes = BranchOutcomes(context.branch) if context.branch else None
         with opener(str(path), "rt", encoding="utf-8-sig", errors="strict") as trace:
             counts, stats = count_pcs(trace, input_format=args.input_format,
-                                      allow_empty=not args.executed_only)
+                                      allow_empty=not args.executed_only, outcomes=outcomes)
         parsed = time.monotonic()
         if not stats.events:
             raise ConversionError("no Tarmac instruction/exception records; empty or unrelated log")
         context.prepare(counts, stats)
+        branch = None
+        if outcomes is not None:
+            outcomes.finish(counts, stats)
+            branch = BranchCounts(branch_targets(context.branch), outcomes.jump, outcomes.fall)
         mapped = time.monotonic()
         if not args.merge_only:
             with atomic_text(destination) as file:
-                context.write(file, counts)
+                context.write(file, counts, branch)
         finished = time.monotonic()
-        # Transfer only executed PCs, never the ELF-wide zero baseline or log.
+        # Transfer only executed PCs and sparse branch counts, never the
+        # ELF-wide zero baseline or log.
         return (path, destination.name, counts, vars(stats),
                 {"parse": parsed - started, "map": mapped - parsed,
-                 "write": finished - mapped, "total": finished - started}, None)
+                 "write": finished - mapped, "total": finished - started}, None,
+                (outcomes.jump, outcomes.fall) if outcomes is not None else None)
     except (ConversionError, OSError, UnicodeError, EOFError) as exc:
-        return path, destination.name, None, None, None, str(exc)
+        return path, destination.name, None, None, None, str(exc), None
 
 
 def progress(message, args):
@@ -709,6 +1006,7 @@ def run_batch(args):
     progress("ELF analysis complete in {:.2f}s".format(time.monotonic() - started), args)
     output.mkdir(parents=True, exist_ok=True)
     total = Counter()
+    branch_total = BranchCounts.empty(branch_targets(context.branch)) if context.branch else None
     coverage = CoverageIndex()
     workers = min(args.workers, len(paths))
     progress("Converting with {} worker process(es)...".format(workers), args)
@@ -734,12 +1032,14 @@ def run_batch(args):
               "coverage_index": None}
     tasks = [(path, output / name) for path, name in zip(paths, names)]
     for index, result in enumerate(batch_results(tasks, context, args, workers), 1):
-        path, name, counts, stats, timings, error = result
+        path, name, counts, stats, timings, error, outcomes = result
         test_index = indices[path]
         entry = manifest[test_index - 1]
         if error is None:
             merge_started = time.monotonic()
             total.update(counts)
+            if branch_total is not None and outcomes is not None:
+                branch_total.add(*outcomes)
             coverage_started = time.monotonic()
             coverage.add(test_index, counts)
             report["coverage_seconds"] += time.monotonic() - coverage_started
@@ -766,9 +1066,10 @@ def run_batch(args):
         context.resolve(total)
         coverage_started = time.monotonic()
         with atomic_text(output / name) as file:
-            coverage.write(file, context, total)
+            coverage.write(file, context, total, branch_total)
             with atomic_text(output / index_name) as index_file:
                 json.dump({"version": 3, "elf": str(args.elf.resolve()), "root": str(root),
+                           "branch_semantics": BRANCH_SEMANTICS if branch_total else None,
                            "merged_output": merge_name, "tests": manifest,
                            "successful_tests": len(report["successful"]),
                            "failed_tests": len(report["failed"]),
@@ -855,13 +1156,19 @@ def list_profiles(list_path, patterns, outputs, excluding=False):
 def read_ir_profile(path):
     """Read this converter's absolute PC/line/Ir format, not arbitrary callgrind.
 
-    Reject multi-event totals: their original test membership cannot be recovered
+    Accepts `events: Ir` and `events: Ir Bs Bj Bf` (branch coverage). Reject
+    multi-event totals: their original test membership cannot be recovered
     by treating the aggregate as an individual test. Require a matching summary
     so a truncated file is never silently merged.
+
+    Returns (counts, sources, ELF path, BranchCounts or None).
     """
     counts, sources, headers = Counter(), {}, {}
     filename = function = None
     summary = None
+    branch = None
+    jcnd = None  # (jumped, executed, target) waiting for its source position
+    position_only = None  # PC of the position line that follows jcnd=
     opener = gzip.open if path.name.endswith(".gz") else open
     with opener(str(path), "rt", encoding="utf-8-sig", errors="strict") as file:
         for number, raw in enumerate(file, 1):
@@ -876,29 +1183,69 @@ def read_ir_profile(path):
                     if key in headers or sources:
                         raise ValueError("duplicate or misplaced header")
                     headers[key] = value.strip()
-                    if key == "events" and value.split() != ["Ir"]:
-                        raise ValueError("only individual Ir-only profiles are supported; do not merge totals")
+                    if key == "events":
+                        if value.split() == ["Ir"] + BRANCH_EVENTS.split():
+                            branch = BranchCounts({}, Counter(), Counter())
+                        elif value.split() != ["Ir"]:
+                            raise ValueError("only individual Ir-only profiles are supported; do not merge totals")
                 elif line.startswith("fl="):
                     filename, function = line[3:], None
                 elif line.startswith("fn="):
                     function = line[3:]
+                elif line.startswith("jcnd="):
+                    if branch is None or jcnd is not None:
+                        raise ValueError("unexpected jcnd= record")
+                    counts_text, target_text, _ = line[5:].split()
+                    jumped, executed = map(int, counts_text.split("/"))
+                    jcnd = (jumped, executed, int(target_text, 16))
+                    position_only = None
                 elif line.startswith("summary:"):
-                    summary = int(line.split(":", 1)[1].strip())
+                    values = list(map(int, line.split(":", 1)[1].split()))
+                    summary = values[0]
+                    if branch is not None:
+                        if values[1:] != [len(branch.targets), sum(branch.jump.values()),
+                                          sum(branch.fall.values())]:
+                            raise ValueError("branch summary mismatch")
+                    elif len(values) != 1:
+                        raise ValueError("summary has more values than events")
                 elif line.startswith(("0x", "0X")):
-                    if headers.get("positions") != "instr line" or headers.get("events") != "Ir":
+                    if headers.get("positions") != "instr line" or "events" not in headers:
                         raise ValueError("expected positions: instr line and events: Ir")
                     if filename is None or function is None:
                         raise ValueError("missing fl/fn before instruction")
-                    pc_text, line_text, cost_text = line.split()
-                    pc, line_number, cost = int(pc_text, 16), int(line_text), int(cost_text)
-                    if min(pc, line_number, cost) < 0:
-                        raise ValueError("negative PC, line or Ir")
+                    fields = line.split()
+                    pc, line_number = int(fields[0], 16), int(fields[1])
+                    if len(fields) == 2:
+                        if jcnd is None or position_only is not None:
+                            raise ValueError("position without costs outside a jcnd= record")
+                        position_only = pc
+                        continue
+                    values = list(map(int, fields[2:]))
+                    if len(values) not in ((1, 4) if branch is not None else (1,)):
+                        raise ValueError("unexpected number of costs")
+                    cost = values[0]
+                    if min(pc, line_number, *values) < 0:
+                        raise ValueError("negative PC, line or cost")
                     source = Source(filename, function, line_number)
                     if pc in sources and sources[pc] != source:
                         raise ValueError("conflicting source mapping for PC")
                     sources[pc] = source
                     if cost:
                         counts[pc] += cost
+                    if len(values) == 4 and values[1]:
+                        target = None
+                        if jcnd is not None:
+                            if position_only != pc or jcnd[1] != values[2] + values[3] or jcnd[0] != values[2]:
+                                raise ValueError("jcnd= does not match its branch site")
+                            target = jcnd[2]
+                        branch.targets[pc] = target
+                        if values[2]:
+                            branch.jump[pc] += values[2]
+                        if values[3]:
+                            branch.fall[pc] += values[3]
+                    elif jcnd is not None:
+                        raise ValueError("jcnd= not followed by its branch site")
+                    jcnd = position_only = None
                 else:
                     raise ValueError("unsupported record; use this converter's individual output")
             except ValueError as exc:
@@ -911,13 +1258,13 @@ def read_ir_profile(path):
             raise ValueError("invalid object path")
     except (KeyError, ValueError) as exc:
         raise ConversionError("{}: expected ob: followed by a quoted ELF path".format(path)) from exc
-    return counts, sources, obj
+    return counts, sources, obj, branch
 
 
 def run_profile_merge(args):
     if (args.trace is not None or args.elf or args.output_dir or args.output is None or
             args.pattern or args.log_name or args.merge_only or args.workers != 1 or
-            args.addr2line or args.objdump or args.executed_only or args.load_offset or
+            args.addr2line or args.objdump or args.executed_only or args.no_branch or args.load_offset or
             args.skip_malformed or args.pc_counts or args.stats or args.input_format != "auto" or args.max_depth != 1):
         raise ConversionError("--merge-list requires -o FILE and uses existing profiles; omit trace/ELF and conversion options")
     started = time.monotonic()
@@ -959,9 +1306,20 @@ def run_profile_merge(args):
         entries.sort()
     coverage = CoverageIndex([index for index, _ in entries])
     total, sources, obj, manifest = Counter(), {}, None, []
+    branch = None
     progress("[0/{}] merging existing profiles".format(len(entries)), args)
     for internal_index, (test_index, path) in enumerate(entries, 1):
-        counts, mapping, current_obj = read_ir_profile(path)
+        counts, mapping, current_obj, profile_branch = read_ir_profile(path)
+        if branch is None and internal_index == 1:
+            branch = profile_branch
+        elif (branch is None) != (profile_branch is None):
+            raise ConversionError("{}: mixes profiles with and without branch events; "
+                                  "reconvert all with or all without --no-branch".format(path))
+        elif profile_branch is not None:
+            if profile_branch.targets != branch.targets:
+                raise ConversionError("{}: branch sites differ; merge only profiles from the same image".format(path))
+            if internal_index > 1:
+                branch.add(profile_branch.jump, profile_branch.fall)
         if obj is None:
             obj = current_obj
         elif obj != current_obj:
@@ -982,9 +1340,10 @@ def run_profile_merge(args):
     context.layout = context.make_layout(context.baseline)
     # All selected files must pass before any result is replaced.
     with atomic_text(output) as file:
-        coverage.write(file, context, total)
+        coverage.write(file, context, total, branch)
         with atomic_text(index_path) as index_file:
             json.dump({"version": 3, "elf": obj, "input_kind": "individual_profile",
+                       "branch_semantics": BRANCH_SEMANTICS if branch else None,
                        "merged_output": str(output), "tests": manifest,
                        "successful_tests": len(entries), "failed_tests": 0,
                        "coverage_unit": "source_line", "indices_preserved": not args.reindex,
@@ -1030,7 +1389,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--format", choices=("auto", "es", "it"), default="auto", dest="input_format")
     parser.add_argument("--addr2line", help="GNU-compatible addr2line (auto-detect by default; use objdump -l if none found)")
     parser.add_argument("--objdump", help="target-compatible objdump for ELF instruction enumeration")
-    parser.add_argument("--executed-only", action="store_true", help="omit unexecuted ELF locations (legacy behavior; no objdump needed)")
+    parser.add_argument("--executed-only", action="store_true", help="omit unexecuted ELF locations (legacy behavior; no objdump needed; disables branch coverage)")
+    parser.add_argument("--no-branch", action="store_true", help="do not add branch coverage events (Bs Bj Bf) and jcnd= records")
     parser.add_argument("--load-offset", type=integer, default=0, help="runtime PC minus ELF address (decimal/hex)")
     parser.add_argument("--skip-malformed", action="store_true", help="omit unsupported instruction records and warn (default: fail)")
     parser.add_argument("--pc-counts", type=Path, help="optional CSV audit: PC, ELF address, Ir, source")
@@ -1081,8 +1441,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             raise ConversionError("single-log conversion requires -o/--output")
         validate_paths(args)
         tool = find_addr2line(args.addr2line)
+        # Disassemble before streaming the trace: branch outcomes are resolved
+        # while reading, so the branch sites must already be known.
+        dump = None
+        if tool is None:
+            print("info: addr2line not found on PATH; using objdump -l for source locations", file=sys.stderr)
+            dump = disassemble(args.elf, find_objdump(args.objdump, None), with_lines=True)
+        elif not args.executed_only:
+            dump = disassemble(args.elf, find_objdump(args.objdump, tool))
+        outcomes = None
+        if dump is not None and not args.executed_only and not args.no_branch:
+            analysis = analyze_branches(dump, args.load_offset)
+            outcomes = BranchOutcomes(analysis) if analysis.sites else None
         options = dict(input_format=args.input_format, skip_malformed=args.skip_malformed,
-                       allow_empty=not args.executed_only)
+                       allow_empty=not args.executed_only, outcomes=outcomes)
         if args.trace == "-":
             counts, stats = count_pcs(sys.stdin, **options)
         else:
@@ -1090,8 +1462,6 @@ def main(argv: Optional[List[str]] = None) -> int:
             with opener(args.trace, "rt", encoding="utf-8-sig", errors="strict") as trace:
                 counts, stats = count_pcs(trace, **options)
         if tool is None:
-            print("info: addr2line not found on PATH; using objdump -l for source locations", file=sys.stderr)
-            dump = disassemble(args.elf, find_objdump(args.objdump, None), with_lines=True)
             elf_sources = objdump_sources(dump)
             if not elf_sources:
                 raise ConversionError("objdump found no executable instructions in the ELF")
@@ -1102,10 +1472,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             sources = {pc: elf_sources.get(pc - args.load_offset, Source()) for pc in counts}
         else:
             if not args.executed_only:
-                stats.elf_instruction_pcs = seed_elf_pcs(
-                    counts, args.elf, find_objdump(args.objdump, tool), args.load_offset
-                )
+                stats.elf_instruction_pcs = seed_pcs(counts, instruction_pcs(dump), args.load_offset)
             sources = resolve_pcs(counts, args.elf, tool, load_offset=args.load_offset)
+        branch = None
+        if outcomes is not None:
+            outcomes.finish(counts, stats)
+            branch = BranchCounts(branch_targets(outcomes), outcomes.jump, outcomes.fall)
         costs = aggregate(counts, sources, stats)
         if args.pc_counts:
             with atomic_text(args.pc_counts) as out:
@@ -1120,13 +1492,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                 json.dump(vars(stats), out, indent=2, sort_keys=True)
                 out.write("\n")
         with atomic_text(args.output) as out:
-            write_cachegrind(out, costs, args.elf)
+            write_cachegrind(out, costs, args.elf, branch)
         print("complete " + json.dumps(str(args.output), ensure_ascii=False), file=sys.stderr, flush=True)
         print(f"{stats.instructions:,} instructions, {stats.unique_pcs:,} unique PCs -> {args.output}", file=sys.stderr)
         if not stats.instructions:
             print("warning: no executed instructions found; output contains only zero-cost ELF locations", file=sys.stderr)
         if stats.malformed:
             print(f"warning: omitted {stats.malformed} malformed instruction records", file=sys.stderr)
+        if branch is not None:
+            print(f"branch coverage: {stats.branch_outcomes_covered}/{2 * stats.branch_sites} outcomes "
+                  f"at {stats.branch_sites} sites", file=sys.stderr)
+            if stats.branch_unresolved:
+                print(f"info: {stats.branch_unresolved:,} branch executions unresolved (exception or "
+                      "trace end right after the branch); they are not counted as covered", file=sys.stderr)
         if stats.unknown_source_instructions or stats.unknown_function_instructions:
             print(
                 f"warning: {stats.unknown_source_instructions:,} instructions without source lines; "
