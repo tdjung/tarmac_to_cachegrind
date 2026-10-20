@@ -102,6 +102,22 @@ class ClassifyTests(unittest.TestCase):
             with self.subTest(mnemonic=mnemonic):
                 self.assertEqual(converter.classify_branch(mnemonic, operands), expected)
 
+    def test_unconditional_jumps_for_bi(self):
+        for mnemonic, operands in (("b", "1a"), ("b.n", "1a"), ("b.w", "1a"), ("bl", "1a <f>"),
+                                   ("blx", "r3"), ("bx", "lr"), ("bxns", "lr"), ("blxns", "r3"),
+                                   ("tbb", "[pc, r0]"), ("tbh.w", "[pc, r0, lsl #1]"),
+                                   ("pop", "{r4, pc}"), ("pop.w", "{r4, r5, pc}"),
+                                   ("ldmia.w", "sp!, {r4, pc}"), ("ldr.w", "pc, [sp], #4"),
+                                   ("mov", "pc, r3")):
+            with self.subTest(mnemonic=mnemonic):
+                self.assertTrue(converter.is_jump(mnemonic, operands))
+                self.assertIsNone(converter.classify_branch(mnemonic, operands))
+        for mnemonic, operands in (("beq", "1a"), ("cbz", "r0, 1a"), ("bxeq", "lr"), ("blgt", "1a"),
+                                   ("pop", "{r4, r5}"), ("ldr", "r0, [pc, #4]"), ("movs", "r0, #1"),
+                                   ("bics", "r0, r1"), ("bkpt", "0x00ab")):
+            with self.subTest(mnemonic=mnemonic):
+                self.assertFalse(converter.is_jump(mnemonic, operands))
+
     def test_not_conditional_branches(self):
         for mnemonic, operands in (("b", "1a"), ("b.n", "1a"), ("bl", "1a"), ("blx", "r3"),
                                    ("bx", "lr"), ("blxns", "r3"), ("pop", "{r4, pc}"),
@@ -116,6 +132,7 @@ class AnalysisTests(unittest.TestCase):
     def test_gnu_and_llvm_listings_agree(self):
         gnu, llvm = converter.analyze_branches(GNU_LISTING), converter.analyze_branches(LLVM_LISTING)
         self.assertEqual(gnu.sites, llvm.sites)
+        self.assertEqual(gnu.jumps, llvm.jumps)
         self.assertEqual(gnu.conditional, llvm.conditional)
         self.assertEqual(converter.instruction_pcs(GNU_LISTING), converter.instruction_pcs(LLVM_LISTING))
         self.assertNotIn(0xB8, converter.instruction_pcs(LLVM_LISTING))
@@ -134,6 +151,8 @@ class AnalysisTests(unittest.TestCase):
         })
         # movge is conditional but not a branch; bxeq in an IT block is a site.
         self.assertEqual(analysis.conditional, frozenset({0x10A8}))
+        # bx lr is the only unconditional jump in the listing.
+        self.assertEqual(analysis.jumps, frozenset({0x10AA}))
         self.assertEqual(analysis.entries, frozenset({0x10A0}))
 
     def test_gnu_ascii_data_dump_is_not_an_instruction(self):
@@ -146,6 +165,7 @@ class AnalysisTests(unittest.TestCase):
             gnu, llvm = (converter.analyze_branches(disassembly(core, tool)) for tool in OBJDUMPS)
             self.assertEqual(gnu.sites, llvm.sites)
             self.assertEqual(gnu.conditional, llvm.conditional)
+            self.assertEqual(gnu.jumps, llvm.jumps)
             self.assertEqual(len(gnu.sites), 19)
             self.assertEqual(Counter(s.kind for s in gnu.sites.values()),
                              {"bcc": 14, "cbz": 2, "indirect": 2, "call": 1})
@@ -269,7 +289,7 @@ class OutputTests(unittest.TestCase):
 
     def test_single_log_format(self):
         text, err = self.convert("m4", "es")
-        self.assertIn("events: Ir Bs Bj Bf\n", text)
+        self.assertIn("events: Ir Bc Bcm Bi Bim Bs\n", text)
         self.assertIn("branch coverage: 31/38 outcomes at 19 sites", err)
         lines = text.splitlines()
         jcnd = [i for i, line in enumerate(lines) if line.startswith("jcnd=")]
@@ -279,9 +299,17 @@ class OutputTests(unittest.TestCase):
             position, row = lines[i + 1].split(), lines[i + 2].split()
             self.assertEqual(len(position), 2)
             self.assertEqual(position, row[:2])
-            self.assertEqual((int(row[3]), int(row[4]), int(row[5])), (1, jumped, executed - jumped))
-        summary = lines[-1].split()[1:]
-        self.assertEqual(summary[1], "19")
+            # Ir Bc Bcm Bi Bim Bs: Bc = resolved executions, Bcm = not taken.
+            self.assertEqual([int(v) for v in row[3:]], [executed, executed - jumped, 0, 0, 1])
+        summary = [int(v) for v in lines[-1].split()[1:]]
+        self.assertEqual(summary[5], 19)          # Bs: every site, executed or not
+        self.assertEqual(summary[3], summary[4])  # Bim = Bi
+        rows = {line.split()[0]: line.split() for line in lines if line.startswith("0x")}
+        jumps = [r for r in rows.values() if len(r) == 8 and r[5] != "0"]
+        self.assertTrue(jumps, "unconditional jumps must carry Bi")
+        for r in jumps:
+            # Bi is the jump's executions: its Ir. Never also a conditional site.
+            self.assertEqual((r[2], r[3], r[4], r[5], r[6], r[7]), (r[2], "0", "0", r[2], r[2], "0"))
         counts, _, _, branch = converter.read_ir_profile(self.dir / "m4.es.out")
         self.assertEqual(len(branch.targets), 19)
         self.assertEqual(sum(1 for t in branch.targets.values() if t is None), 2)
@@ -310,7 +338,7 @@ class OutputTests(unittest.TestCase):
         if not total.exists():
             total = out / "total_merge_cachegrind.out"
         index = json.loads((out / "coverage_index.json").read_text())
-        self.assertIn("Bj", index["branch_semantics"])
+        self.assertIn("Bcm", index["branch_semantics"])
         listing = self.dir / "list.txt"
         listing.write_text("\n".join(str(p) for p in sorted(out.glob("[0-9]*_cachegrind.out"))) + "\n")
         merged = self.dir / "merged.out"
@@ -321,11 +349,11 @@ class OutputTests(unittest.TestCase):
             rows = {}
             for line in path.read_text().splitlines():
                 fields = line.split()
-                if line.startswith("0x") and len(fields) == 2 + 1 + 13 + 3:
-                    rows[fields[0]] = fields[-3:]
+                if line.startswith("0x") and len(fields) == 2 + 1 + 13 + 5:
+                    rows[fields[0]] = fields[-5:]
             return rows
 
-        self.assertEqual(len(branch_rows(total)), 19)
+        self.assertEqual(sum(1 for r in branch_rows(total).values() if r[4] == "1"), 19)
         self.assertEqual(branch_rows(total), branch_rows(merged))
         self.assertEqual(total.read_text().splitlines()[-1], merged.read_text().splitlines()[-1])
         self.assertIn("jcnd=", merged.read_text())
@@ -347,6 +375,33 @@ class OutputTests(unittest.TestCase):
         self.assertIn("jcnd= does not match", err.getvalue())
 
 
+@unittest.skipUnless(ADDR2LINE, "needs an Arm-capable addr2line")
+class InlineAttributionTests(unittest.TestCase):
+    """func_B inlined into func_A under a condition (tests/firmware/inline.c).
+
+    addr2line -f names the inlined instructions func_B, which split them out
+    of func_A into their own fn= block. They must stay in func_A, with
+    func_B's source line, as the objdump -l fallback already does.
+    """
+
+    def test_inlined_instructions_stay_in_containing_function(self):
+        elf = FIRMWARE / "inline_m4.elf"
+        source = (FIRMWARE / "inline.c").read_text().splitlines()
+        body = next(i for i, line in enumerate(source, 1) if "sink = v * 3" in line)
+        pcs = converter.instruction_pcs(disassembly_of(elf))
+        tools = [t for t in (arm_tool("arm-none-eabi-addr2line"), arm_tool("llvm-addr2line")) if t]
+        for tool in tools:
+            with self.subTest(tool=tool):
+                sources = converter.resolve_pcs(pcs, elf, tool)
+                self.assertEqual({s.function for s in sources.values()}, {"func_A"})
+                self.assertIn(body, {s.line for s in sources.values()})
+
+
+def disassembly_of(elf):
+    return subprocess.run([OBJDUMP, "-d", "-z", "--no-show-raw-insn", str(elf)],
+                          check=True, stdout=subprocess.PIPE, universal_newlines=True).stdout
+
+
 class WriterTests(unittest.TestCase):
     def test_write_cachegrind_round_trips_branch_counts(self):
         costs = Counter({converter.Position(0x100, "a.c", "f", 1): 3,
@@ -354,14 +409,15 @@ class WriterTests(unittest.TestCase):
                          converter.Position(0x104, "a.c", "f", 2): 0,
                          converter.Position(0x106, "a.c", "f", 3): 2})
         branch = converter.BranchCounts({0x102: 0x106, 0x104: None},
-                                        Counter({0x102: 1}), Counter({0x102: 2}))
+                                        Counter({0x102: 1}), Counter({0x102: 2}),
+                                        Counter({0x106: 2}))
         out = io.StringIO()
         converter.write_cachegrind(out, costs, Path("fw.elf"), branch)
         self.assertEqual(out.getvalue(),
-            "# callgrind format\npositions: instr line\nevents: Ir Bs Bj Bf\nob: \"fw.elf\"\n"
+            "# callgrind format\npositions: instr line\nevents: Ir Bc Bcm Bi Bim Bs\nob: \"fw.elf\"\n"
             "fl=a.c\nfn=f\n0x100 1 3\n"
-            "jcnd=1/3 0x106 3\n0x102 1\n0x102 1 1 1 1 2\n"
-            "0x104 2 0 1 0 0\n0x106 3 2\nsummary: 6 2 1 2\n")
+            "jcnd=1/3 0x106 3\n0x102 1\n0x102 1 1 3 2 0 0 1\n"
+            "0x104 2 0 0 0 0 0 1\n0x106 3 2 0 0 2 2 0\nsummary: 6 3 2 2 2 2\n")
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "p.out"
             path.write_text(out.getvalue())
@@ -372,7 +428,7 @@ class WriterTests(unittest.TestCase):
     def test_no_sites_writes_legacy_header(self):
         costs = Counter({converter.Position(0x100, "a.c", "f", 1): 1})
         out = io.StringIO()
-        converter.write_cachegrind(out, costs, Path("fw.elf"), converter.BranchCounts({}, Counter(), Counter()))
+        converter.write_cachegrind(out, costs, Path("fw.elf"), converter.BranchCounts.empty({}))
         self.assertIn("events: Ir\n", out.getvalue())
         self.assertTrue(out.getvalue().endswith("summary: 1\n"))
 

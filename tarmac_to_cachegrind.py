@@ -227,8 +227,18 @@ def resolve_pcs(
 ) -> Dict[int, Source]:
     """Resolve unique PCs in bounded stdin batches, never one process per hit.
 
-    No -i: attribute each PC once using addr2line's single-frame result. This
-    neither reconstructs dynamic call stacks nor multiplies counts for inlining.
+    Uses `-a -f -i`: for inlined code addr2line prints the inline chain, from
+    the inlined function out to the function the code physically lives in.
+    The source FILE and LINE come from the first frame, so an inlined body's
+    own lines are the ones marked executed. The FUNCTION comes from the last
+    frame, so the instruction stays in the function that contains it. Without
+    this, code inlined from func_B into func_A was listed as a separate
+    `fn=func_B` and left a gap in func_A's instructions. This matches the
+    objdump fallback, which names functions by their ELF symbol.
+
+    Each PC is attributed once; counts are never multiplied for inlining.
+    `-a` prints each query address first, which delimits the variable-length
+    frame lists.
     """
     if batch_size < 1:
         raise ConversionError("batch size must be positive")
@@ -242,7 +252,7 @@ def resolve_pcs(
             raise ConversionError("--load-offset produces a negative ELF address")
         try:
             result = subprocess.run(
-                [tool, "-e", str(elf.resolve()), "-f", "-C"],
+                [tool, "-e", str(elf.resolve()), "-a", "-f", "-i", "-C"],
                 input="".join(f"0x{pc:x}\n" for pc in queries),
                 universal_newlines=True, encoding="utf-8", errors="replace",
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -252,15 +262,27 @@ def resolve_pcs(
             raise ConversionError(f"cannot run addr2line: {exc}") from exc
         if result.returncode:
             raise ConversionError(f"addr2line failed: {result.stderr.strip()}")
-        output = result.stdout.splitlines()
-        if len(output) != 2 * len(batch):
-            raise ConversionError(
-                "unexpected addr2line output: expected function/location pairs; "
-                "use a GNU-compatible addr2line"
-            )
+        output = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        position = 0
         for index, pc in enumerate(batch):
-            function = output[2 * index].strip()
-            location = output[2 * index + 1].strip()
+            if position >= len(output) or not _is_address(output[position], queries[index]):
+                raise ConversionError(
+                    "unexpected addr2line output: expected an address line before each result; "
+                    "use a GNU-compatible addr2line that supports -a and -i"
+                )
+            position += 1
+            following = queries[index + 1] if index + 1 < len(batch) else None
+            frames = []
+            while position < len(output) and not (
+                    following is not None and _is_address(output[position], following)):
+                if position + 1 >= len(output):
+                    raise ConversionError("unexpected addr2line output: function without location")
+                frames.append((output[position], output[position + 1]))
+                position += 2
+            if not frames:
+                raise ConversionError("unexpected addr2line output: no function/location pair")
+            location = frames[0][1]
+            function = frames[-1][0]
             match = LOCATION.fullmatch(location)
             if not match:
                 raise ConversionError(f"unexpected addr2line source location: {location!r}")
@@ -270,7 +292,19 @@ def resolve_pcs(
                 function=function if function not in ("", "??", "???") else "???",
                 line=int(line_number) if line_number != "?" else 0,
             )
+        if position != len(output):
+            raise ConversionError("unexpected addr2line output: trailing lines")
     return sources
+
+
+def _is_address(text: str, expected: int) -> bool:
+    """GNU prints `0x00001000`, LLVM `0x1000`."""
+    if not text.lower().startswith("0x"):
+        return False
+    try:
+        return int(text, 16) == expected
+    except ValueError:
+        return False
 
 
 def find_objdump(explicit: Optional[str], addr2line: Optional[str]) -> str:
@@ -377,6 +411,12 @@ INDIRECT_CALL = re.compile(rf"^(?:blx|blxns){CONDITION}{WIDTH}$")
 PC_LIST_LOAD = re.compile(rf"^(?:pop|ldm|ldmia|ldmfd|ldmdb|ldmea){CONDITION}{WIDTH}$")
 PC_DEST = re.compile(rf"^(?:ldr|mov){CONDITION}{WIDTH}$")
 IT_BLOCK = re.compile(r"^it[te]{0,3}$")
+# Unconditional control transfers (Bi/Bim). Inside an IT block every
+# instruction carries a condition suffix, so these never match there.
+JUMP_DIRECT = re.compile(rf"^(?:b|bl){WIDTH}$")
+JUMP_INDIRECT = re.compile(rf"^(?:bx|blx|bxns|blxns|tbb|tbh){WIDTH}$")
+JUMP_PC_LIST = re.compile(rf"^(?:pop|ldm|ldmia|ldmfd|ldmdb|ldmea){WIDTH}$")
+JUMP_PC_DEST = re.compile(rf"^(?:ldr|mov|add){WIDTH}$")
 
 BranchSite = namedtuple("BranchSite", "pc target fallthrough kind")
 SYMBOL = re.compile(r"^([0-9a-fA-F]+) <[^>]+>:$")
@@ -414,7 +454,18 @@ def classify_branch(mnemonic: str, operands: str):
     return None
 
 
-BranchAnalysis = namedtuple("BranchAnalysis", "sites conditional entries")
+def is_jump(mnemonic: str, operands: str) -> bool:
+    """Unconditional branch, call, return or table branch (counted as Bi)."""
+    mnemonic = mnemonic.lower()
+    if JUMP_DIRECT.match(mnemonic) or JUMP_INDIRECT.match(mnemonic):
+        return True
+    lowered = operands.lower()
+    if JUMP_PC_LIST.match(mnemonic) and re.search(r"\bpc\b", lowered.split("{", 1)[-1]):
+        return True
+    return bool(JUMP_PC_DEST.match(mnemonic) and lowered.split(",", 1)[0].strip() == "pc")
+
+
+BranchAnalysis = namedtuple("BranchAnalysis", "sites conditional entries jumps")
 
 
 def analyze_branches(disassembly: str, load_offset: int = 0) -> BranchAnalysis:
@@ -422,13 +473,15 @@ def analyze_branches(disassembly: str, load_offset: int = 0) -> BranchAnalysis:
 
     Returns BranchAnalysis(sites={runtime_pc: BranchSite}, conditional=
     frozenset of conditional non-branch instructions inside IT blocks,
-    entries=frozenset of symbol start addresses). Addresses are ELF addresses
+    entries=frozenset of symbol start addresses, jumps=frozenset of
+    unconditional branch/call/return instructions). Addresses are ELF addresses
     plus load_offset. The fallthrough is the next listed address, so literal
     data after a branch is still a valid boundary.
     """
     sites = {}  # type: Dict[int, BranchSite]
     conditional = set()
     entries = set()
+    jumps = set()
     pending = []  # [elf_pc, kind, target] waiting for the next address
     it_remaining = 0
     for raw in disassembly.splitlines():
@@ -457,6 +510,8 @@ def analyze_branches(disassembly: str, load_offset: int = 0) -> BranchAnalysis:
             pending.append((pc, found[0], found[1]))
         elif it_remaining:
             conditional.add(pc + load_offset)
+        elif is_jump(mnemonic, operands):
+            jumps.add(pc + load_offset)
         if it_remaining:
             it_remaining -= 1
         if IT_BLOCK.match(mnemonic.lower()):
@@ -465,7 +520,7 @@ def analyze_branches(disassembly: str, load_offset: int = 0) -> BranchAnalysis:
         # Last instruction in the listing: no known fallthrough.
         sites[site_pc + load_offset] = BranchSite(
             site_pc + load_offset, None if target is None else target + load_offset, None, kind)
-    return BranchAnalysis(sites, frozenset(conditional), frozenset(entries))
+    return BranchAnalysis(sites, frozenset(conditional), frozenset(entries), frozenset(jumps))
 
 
 class BranchOutcomes:
@@ -475,6 +530,7 @@ class BranchOutcomes:
         self.sites = analysis.sites if analysis else {}
         self.conditional = analysis.conditional if analysis else frozenset()
         self.entries = analysis.entries if analysis else frozenset()
+        self.jumps = analysis.jumps if analysis else frozenset()
         self.jump = Counter()  # type: CounterType[int]
         self.fall = Counter()  # type: CounterType[int]
         self.conditional_skipped = Counter()  # type: CounterType[int]
@@ -532,33 +588,40 @@ def one_line(value: str) -> str:
     return value.replace("\r", " ").replace("\n", " ")
 
 
-BRANCH_EVENTS = "Bs Bj Bf"
+BRANCH_EVENTS = "Bc Bcm Bi Bim Bs"
 BRANCH_SEMANTICS = (
-    "Bs=1 marks a conditional branch site (summed when profiles merge; >0 means site); "
-    "Bj/Bf count jumps to the target and falls to the next instruction, summed over tests; "
-    "a site is fully covered when Bj>0 and Bf>0; jcnd= gives jumped/executed and the target")
+    "Bc: executions of a conditional branch whose outcome was resolved; "
+    "Bcm: those that were not taken (fell through to the next instruction); "
+    "taken = Bc - Bcm; a site is fully covered when Bc - Bcm > 0 and Bcm > 0. "
+    "Bi: executions of unconditional branches/calls/returns; Bim = Bi. "
+    "Bs=1 marks a conditional branch site, executed or not (the coverage denominator; "
+    "summed when profiles merge). jcnd= gives taken/Bc and the jump target.")
 
 
-class BranchCounts(namedtuple("BranchCountsBase", "targets jump fall")):
+class BranchCounts(namedtuple("BranchCountsBase", "targets jump fall jumps")):
     """What a profile needs to say about branches.
 
-    targets maps every branch site PC to its jump target PC (None for
-    indirect sites); jump/fall count how often each successor was reached.
-    Sites with no counts are still listed: they are the coverage denominator.
+    targets maps every conditional branch site PC to its jump target PC (None
+    for indirect sites); jump/fall count resolved taken/not-taken outcomes, so
+    Bc = jump + fall and Bcm = fall. jumps counts executions of unconditional
+    branches (Bi = Bim). Sites with no counts are still listed: they are the
+    coverage denominator.
     """
 
     __slots__ = ()
 
     @classmethod
     def empty(cls, targets):
-        return cls(dict(targets), Counter(), Counter())
+        return cls(dict(targets), Counter(), Counter(), Counter())
 
-    def add(self, jump, fall):
+    def add(self, jump, fall, jumps):
         self.jump.update(jump)
         self.fall.update(fall)
+        self.jumps.update(jumps)
 
     def summary(self):
-        return " {} {} {}".format(len(self.targets), sum(self.jump.values()), sum(self.fall.values()))
+        taken, fall, jumps = sum(self.jump.values()), sum(self.fall.values()), sum(self.jumps.values())
+        return " {} {} {} {} {}".format(taken + fall, fall, jumps, jumps, len(self.targets))
 
 
 def branch_targets(analysis):
@@ -566,22 +629,35 @@ def branch_targets(analysis):
     return {pc: site.target for pc, site in analysis.sites.items()} if analysis else {}
 
 
-def branch_row(prefix, pc, branch, target_line):
-    """Split a layout prefix and return (text before costs, branch cost suffix).
+def jump_counts(analysis, counts):
+    """Bi per unconditional jump PC: its executions, i.e. its Ir."""
+    if not analysis:
+        return Counter()
+    return Counter({pc: counts[pc] for pc in analysis.jumps if counts.get(pc, 0) > 0})
 
-    The site's cost row carries Bs=1 and its jump/fall counts. A direct site
-    is preceded by `jcnd=<jumped>/<executed> <target pc> <target line>` and a
-    position-only line: callgrind readers take the line after jcnd= as the
-    jump's source position, never as costs, so the real cost row follows it.
+
+def branch_row(prefix, pc, branch, target_line):
+    """Return (text before costs, branch cost suffix) for a row, or None.
+
+    A conditional site's row carries `Bc Bcm 0 0 1`; an executed unconditional
+    jump's row carries `0 0 Bi Bim 0`. A direct site is preceded by
+    `jcnd=<taken>/<Bc> <target pc> <target line>` and a position-only line:
+    callgrind readers take the line after jcnd= as the jump's source position,
+    never as costs, so the real cost row follows it.
     """
-    split = prefix.rfind("\n") + 1
-    head, position = prefix[:split], prefix[split:]
-    jump, fall = branch.jump.get(pc, 0), branch.fall.get(pc, 0)
-    target = branch.targets[pc]
-    if target is not None:
-        head += "jcnd={}/{} 0x{:x} {}\n{}\n".format(jump, jump + fall, target, target_line(target),
-                                                    position.rstrip())
-    return head + position, " 1 {} {}".format(jump, fall)
+    if pc in branch.targets:
+        split = prefix.rfind("\n") + 1
+        head, position = prefix[:split], prefix[split:]
+        jump, fall = branch.jump.get(pc, 0), branch.fall.get(pc, 0)
+        target = branch.targets[pc]
+        if target is not None:
+            head += "jcnd={}/{} 0x{:x} {}\n{}\n".format(jump, jump + fall, target, target_line(target),
+                                                        position.rstrip())
+        return head + position, " {} {} 0 0 1".format(jump + fall, fall)
+    executed = branch.jumps.get(pc, 0)
+    if executed:
+        return prefix, " 0 0 {} {} 0".format(executed, executed)
+    return None
 
 
 def write_cachegrind(out: TextIO, costs: CounterType[Position], elf: Path,
@@ -602,9 +678,9 @@ def write_cachegrind(out: TextIO, costs: CounterType[Position], elf: Path,
             prefix = f"fl={one_line(source.file)}\nfn={one_line(source.function)}\n"
             previous = key
         prefix += f"0x{source.pc:x} {source.line} "
-        if branch and source.pc in branch.targets:
-            text, suffix = branch_row(prefix, source.pc, branch, target_line)
-            out.write(f"{text}{costs[source]}{suffix}\n")
+        row = branch_row(prefix, source.pc, branch, target_line) if branch else None
+        if row:
+            out.write(f"{row[0]}{costs[source]}{row[1]}\n")
         else:
             out.write(f"{prefix}{costs[source]}\n")
     out.write("summary: {}{}\n".format(sum(costs.values()), branch.summary() if branch else ""))
@@ -738,11 +814,10 @@ class ProfileContext:
             out.writelines(prefix + str(get(pc)) + "\n" if get(pc, 0) else zero
                            for pc, prefix, zero in layout)
         else:
-            sites = branch.targets
             for pc, prefix, zero in layout:
-                if pc in sites:
-                    text, suffix = branch_row(prefix, pc, branch, self.target_line)
-                    out.write(text + str(get(pc, 0)) + suffix + "\n")
+                row = branch_row(prefix, pc, branch, self.target_line)
+                if row:
+                    out.write(row[0] + str(get(pc, 0)) + row[1] + "\n")
                 else:
                     out.write(prefix + str(get(pc)) + "\n" if get(pc, 0) else zero)
         out.write("summary: {}{}\n".format(sum(counts.values()), branch.summary() if branch else ""))
@@ -881,9 +956,9 @@ class CoverageIndex:
                 values, suffix = self.row(line_masks[key])
                 for i, value in enumerate(values, 1):
                     summary[i] += value
-            if branch is not None and pc in branch.targets:
-                text, branch_suffix = branch_row(prefix, pc, branch, context.target_line)
-                out.write(text + str(count) + suffix[:-1] + branch_suffix + "\n")
+            row = branch_row(prefix, pc, branch, context.target_line) if branch is not None else None
+            if row:
+                out.write(row[0] + str(count) + suffix[:-1] + row[1] + "\n")
             else:
                 out.write(prefix + str(count) + suffix)
         out.write("summary: " + " ".join(map(str, summary)) +
@@ -918,7 +993,8 @@ def convert_batch_file(task, context=None, args=None):
         branch = None
         if outcomes is not None:
             outcomes.finish(counts, stats)
-            branch = BranchCounts(branch_targets(context.branch), outcomes.jump, outcomes.fall)
+            branch = BranchCounts(branch_targets(context.branch), outcomes.jump, outcomes.fall,
+                                  jump_counts(context.branch, counts))
         mapped = time.monotonic()
         if not args.merge_only:
             with atomic_text(destination) as file:
@@ -929,7 +1005,8 @@ def convert_batch_file(task, context=None, args=None):
         return (path, destination.name, counts, vars(stats),
                 {"parse": parsed - started, "map": mapped - parsed,
                  "write": finished - mapped, "total": finished - started}, None,
-                (outcomes.jump, outcomes.fall) if outcomes is not None else None)
+                (outcomes.jump, outcomes.fall, jump_counts(context.branch, counts))
+                if outcomes is not None else None)
     except (ConversionError, OSError, UnicodeError, EOFError) as exc:
         return path, destination.name, None, None, None, str(exc), None
 
@@ -1156,7 +1233,7 @@ def list_profiles(list_path, patterns, outputs, excluding=False):
 def read_ir_profile(path):
     """Read this converter's absolute PC/line/Ir format, not arbitrary callgrind.
 
-    Accepts `events: Ir` and `events: Ir Bs Bj Bf` (branch coverage). Reject
+    Accepts `events: Ir` and `events: Ir Bc Bcm Bi Bim Bs` (branches). Reject
     multi-event totals: their original test membership cannot be recovered
     by treating the aggregate as an individual test. Require a matching summary
     so a truncated file is never silently merged.
@@ -1185,7 +1262,7 @@ def read_ir_profile(path):
                     headers[key] = value.strip()
                     if key == "events":
                         if value.split() == ["Ir"] + BRANCH_EVENTS.split():
-                            branch = BranchCounts({}, Counter(), Counter())
+                            branch = BranchCounts({}, Counter(), Counter(), Counter())
                         elif value.split() != ["Ir"]:
                             raise ValueError("only individual Ir-only profiles are supported; do not merge totals")
                 elif line.startswith("fl="):
@@ -1203,8 +1280,7 @@ def read_ir_profile(path):
                     values = list(map(int, line.split(":", 1)[1].split()))
                     summary = values[0]
                     if branch is not None:
-                        if values[1:] != [len(branch.targets), sum(branch.jump.values()),
-                                          sum(branch.fall.values())]:
+                        if " " + " ".join(map(str, values[1:])) != branch.summary():
                             raise ValueError("branch summary mismatch")
                     elif len(values) != 1:
                         raise ValueError("summary has more values than events")
@@ -1221,7 +1297,7 @@ def read_ir_profile(path):
                         position_only = pc
                         continue
                     values = list(map(int, fields[2:]))
-                    if len(values) not in ((1, 4) if branch is not None else (1,)):
+                    if len(values) not in ((1, 6) if branch is not None else (1,)):
                         raise ValueError("unexpected number of costs")
                     cost = values[0]
                     if min(pc, line_number, *values) < 0:
@@ -1232,19 +1308,27 @@ def read_ir_profile(path):
                     sources[pc] = source
                     if cost:
                         counts[pc] += cost
-                    if len(values) == 4 and values[1]:
+                    if len(values) == 6:
+                        bc, bcm, bi, bim, bs = values[1:]
+                        if bi != bim or bcm > bc or (bs and bi) or (bc and not bs):
+                            raise ValueError("inconsistent Bc/Bcm/Bi/Bim/Bs values")
+                    else:
+                        bc = bcm = bi = bs = 0
+                    if bs:
                         target = None
                         if jcnd is not None:
-                            if position_only != pc or jcnd[1] != values[2] + values[3] or jcnd[0] != values[2]:
+                            if position_only != pc or jcnd[1] != bc or jcnd[0] != bc - bcm:
                                 raise ValueError("jcnd= does not match its branch site")
                             target = jcnd[2]
                         branch.targets[pc] = target
-                        if values[2]:
-                            branch.jump[pc] += values[2]
-                        if values[3]:
-                            branch.fall[pc] += values[3]
+                        if bc - bcm:
+                            branch.jump[pc] += bc - bcm
+                        if bcm:
+                            branch.fall[pc] += bcm
                     elif jcnd is not None:
                         raise ValueError("jcnd= not followed by its branch site")
+                    if bi:
+                        branch.jumps[pc] += bi
                     jcnd = position_only = None
                 else:
                     raise ValueError("unsupported record; use this converter's individual output")
@@ -1319,7 +1403,7 @@ def run_profile_merge(args):
             if profile_branch.targets != branch.targets:
                 raise ConversionError("{}: branch sites differ; merge only profiles from the same image".format(path))
             if internal_index > 1:
-                branch.add(profile_branch.jump, profile_branch.fall)
+                branch.add(profile_branch.jump, profile_branch.fall, profile_branch.jumps)
         if obj is None:
             obj = current_obj
         elif obj != current_obj:
@@ -1390,7 +1474,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--addr2line", help="GNU-compatible addr2line (auto-detect by default; use objdump -l if none found)")
     parser.add_argument("--objdump", help="target-compatible objdump for ELF instruction enumeration")
     parser.add_argument("--executed-only", action="store_true", help="omit unexecuted ELF locations (legacy behavior; no objdump needed; disables branch coverage)")
-    parser.add_argument("--no-branch", action="store_true", help="do not add branch coverage events (Bs Bj Bf) and jcnd= records")
+    parser.add_argument("--no-branch", action="store_true", help="do not add branch events (Bc Bcm Bi Bim Bs) and jcnd= records")
     parser.add_argument("--load-offset", type=integer, default=0, help="runtime PC minus ELF address (decimal/hex)")
     parser.add_argument("--skip-malformed", action="store_true", help="omit unsupported instruction records and warn (default: fail)")
     parser.add_argument("--pc-counts", type=Path, help="optional CSV audit: PC, ELF address, Ir, source")
@@ -1477,7 +1561,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         branch = None
         if outcomes is not None:
             outcomes.finish(counts, stats)
-            branch = BranchCounts(branch_targets(outcomes), outcomes.jump, outcomes.fall)
+            branch = BranchCounts(branch_targets(outcomes), outcomes.jump, outcomes.fall,
+                                  jump_counts(outcomes, counts))
         costs = aggregate(counts, sources, stats)
         if args.pc_counts:
             with atomic_text(args.pc_counts) as out:
