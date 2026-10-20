@@ -664,7 +664,7 @@ ELF 조회에는 `PC - load_offset`을 사용합니다. 함수의 비용은
 **coverage의 범위는 ELF에 남아 있고 소스 라인으로 매핑 가능한 명령어입니다.**
 최적화/링커에 의해 제거된 코드, 주석, 빈 줄은 0인 실행 가능 라인으로 추가하지 않습니다.
 PC별 실행 여부만으로는 조건 분기의 양쪽이 모두 실행됐는지 알 수 없습니다. 분기별
-taken/not taken 여부는 아래 [Branch coverage](#branch-coverage)의 `Bc Bcm Bi Bim Bs` 이벤트로 기록합니다.
+taken/not taken 여부는 아래 [Branch coverage](#branch-coverage)의 `Bc Bcm Bs` 이벤트로 기록합니다.
 
 CSV에도 미실행 PC를 `Ir=0`으로 포함합니다. JSON의 `unique_pcs`는 trace에서 실제로
 실행된 고유 PC 수이고, `elf_instruction_pcs`는 objdump에서 수집한 고유 명령어 주소
@@ -734,34 +734,33 @@ fallback에서는 디스어셈블의 함수 심볼과 파일/라인 표기를 �
 
 기본 모드(ELF 전체를 objdump로 분석하는 모드)에서는 분기 명령어마다 실행 결과를 함께
 기록합니다. 대상은 Cortex-M4(ARMv7E-M)와 Cortex-M35P(ARMv8-M Mainline)의 Thumb/Thumb-2
-명령어이며 추가 옵션은 필요 없습니다. 이벤트 이름은 기존 도구의 `Bc Bcm Bi Bim` 체계를
-따르고, 실행되지 않은 분기를 표시하기 위해 `Bs`를 더합니다.
+명령어이며 추가 옵션은 필요 없습니다. 이벤트 이름은 기존 도구의 `Bc Bcm` 체계를 따르고,
+실행되지 않은 분기를 표시하기 위해 `Bs`를 더합니다. 조건 분기만 기록하며 무조건 분기
+(`Bi`/`Bim`)는 기록하지 않습니다.
 
 ```text
-events: Ir Bc Bcm Bi Bim Bs
+events: Ir Bc Bcm Bs
 fl=src/uart.c
 fn=uart_rx
 jcnd=3/15 0x80ca 25
 0x80b2 23
-0x80b2 23 4 15 12 0 0 1
-0x80c4 25 14 0 0 14 14 0
+0x80b2 23 4 15 12 1
+0x80c4 25 14
 ```
 
 | 이벤트 | 의미 |
 |---|---|
 | `Bc` | 조건 분기가 실행된 횟수. 결과(jump/fall)를 판정한 실행만 셉니다 |
 | `Bcm` | 그중 분기하지 않은(not taken) 횟수. 다음 명령어로 넘어간 경우이며 조건 실패(`CCFAIL`, `IS`)를 포함합니다 |
-| `Bi` | 무조건 분기·호출·return이 실행된 횟수 |
-| `Bim` | 무조건 분기는 항상 not taken으로 보므로 `Bi`와 같습니다 |
-| `Bs` | 조건 분기 위치이면 1. 한 번도 실행되지 않은 분기도 1이며 coverage의 분모입니다 |
+| `Bs` | 조건 분기 위치이면 1. 한 번도 실행되지 않은 분기도 1이며 coverage의 분모입니다. performance profiler는 이 이벤트를 화면에 표시하지 않고 branch coverage 계산에만 씁니다 |
 
 분기한(taken) 횟수는 `Bc − Bcm`입니다. 조건 분기의 양쪽이 모두 커버되려면
 `Bc − Bcm > 0`이고 `Bcm > 0`이어야 합니다. `Bc > 0`은 그 분기가 실행됐다는 뜻일 뿐
 양쪽을 다 갔다는 뜻이 아닙니다. 모든 값은 합산 가능하므로 뷰어나 `--merge-list`에서
 여러 프로파일을 합쳐도 판정이 유지됩니다.
 
-조건 분기 행은 `Ir Bc Bcm 0 0 1`, 실행된 무조건 분기 행은 `Ir 0 0 Bi Bim 0`, 그 밖의 행은
-`Ir`만 기록합니다(callgrind 형식에서 생략된 비용은 0입니다). 대상이 고정된 조건 분기 앞에는
+조건 분기 행은 `Ir Bc Bcm 1`, 그 밖의 행은 `Ir`만 기록합니다(callgrind 형식에서 생략된
+비용은 0입니다). 대상이 고정된 조건 분기 앞에는
 callgrind 표준 `jcnd=<taken>/<Bc> <대상 PC> <대상 라인>` 레코드와 위치만 있는 줄을 둡니다.
 뷰어는 이 정보로 실행되지 않은 쪽의 도착 위치를 화살표로 그립니다.
 
@@ -792,10 +791,10 @@ ELF에 조건 분기가 하나도 없으면 기존과 같은 `events: Ir` 형식
 | IT 블록 안의 `bl<cc>` | `Bc`/`Bcm` | 조건부 호출. taken = 호출함 |
 | IT 블록 안의 `bx<cc>`, `bxns<cc>`, `pop<cc> {..., pc}`, `ldm<cc> {..., pc}`, `ldr<cc> pc, ...`, `mov<cc> pc, ...` | `Bc`/`Bcm` | 조건부 return·점프. 대상이 실행 시점에 정해지므로 `jcnd=` 없음 |
 | IT 블록 안의 `blx<cc>`, `blxns<cc>` | `Bc`/`Bcm` | 조건부 간접 호출, `jcnd=` 없음 |
-| `b`, `bl`, `blx`, `bx`, `bxns`, `blxns`, `tbb`, `tbh`, `pop {..., pc}`, `ldm {..., pc}`, `ldr pc, ...`, `mov pc, ...`, `add pc, ...` | `Bi`/`Bim` | 무조건 분기·호출·return·table branch. 조건이 없으므로 coverage 판정에는 쓰지 않습니다 |
+| `b`, `bl`, `blx`, `bx`, `bxns`, `blxns`, `tbb`, `tbh`, `pop {..., pc}`, `ldr pc, ...` 등 | 기록 안 함 | 무조건 분기·호출·return·table branch. 갈 곳이 하나뿐이라 coverage 대상이 아니며, 실행 횟수는 그 PC의 `Ir`과 같습니다 |
 | IT 블록 안의 분기 아닌 조건부 명령어(`movge`, `ldrls` 등) | 없음 | 아래 [분기 없는 조건부 명령어](#분기-없는-조건부-명령어) 참고 |
 
-`tbb`/`tbh`(switch 문의 jump table)는 무조건 분기로 분류합니다. 어떤 case로 갔는지는
+`tbb`/`tbh`(switch 문의 jump table)는 무조건 분기로 봅니다. 어떤 case로 갔는지는
 case별 코드의 실행 여부(code coverage)로 확인합니다.
 
 분기 위치와 대상, fallthrough 주소는 objdump 출력에서 얻습니다. GNU
@@ -909,7 +908,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 Python 3.6.8 및 3.12.14 인터프리터에서 아래 66개 테스트의 통과를 확인했습니다.
-branch coverage와 inline 귀속 테스트를 더한 91개는 Python 3.13에서 확인했습니다.
+branch coverage와 inline 귀속 테스트를 더한 90개는 Python 3.13에서 확인했습니다.
 `dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,
@@ -938,7 +937,7 @@ branch coverage와 inline 귀속 테스트를 더한 91개는 Python 3.13에서 
 - Branch coverage: 조건 분기 명령어 분류, GNU/LLVM objdump 결과 일치, IT 블록 처리,
   다음 PC 판정 규칙(CCFAIL/IS, IF 중복, 예외, trace 끝, 간접 분기), Cortex-M4/M35P 실제 실행
   trace 4종의 정답 비교, 출력 형식, `--no-branch`/`--executed-only`, 배치 total과
-  `--merge-list` 결과 일치, 혼합/변조 프로파일 거부, `Bi` 분류, inline 코드의 함수 귀속(실제
+  `--merge-list` 결과 일치, 혼합/변조 프로파일 거부, inline 코드의 함수 귀속(실제
   Arm ELF, GNU/LLVM addr2line)을 검증합니다. Arm용 objdump/addr2line이
   없으면 해당 테스트는 skip됩니다.
 
