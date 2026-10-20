@@ -169,6 +169,15 @@ class ResolutionTests(unittest.TestCase):
                              "IS 000000a2 d003 T16 BLT ac", "IT 000000a4 4290 T16 CMP"])
         self.assertEqual((o.jump, o.fall, o.unresolved), ({}, {0xA2: 2}, 0))
 
+    def test_condition_failed_branch_counts_in_ir_other_conditionals_do_not(self):
+        outcomes = converter.BranchOutcomes(converter.analyze_branches(GNU_LISTING))
+        counts, stats = converter.count_pcs(
+            ["ES (000000a2:d003) T thrd: CCFAIL BLT.N ac", "IS 000000a2 d003 T16 BLT ac",
+             "IT 000000a4 4290 T16 CMP", "IS 000000a8 4610 T16 MOVGE"],  # movge: not a branch
+            outcomes=outcomes)
+        self.assertEqual(counts, {0xA2: 2, 0xA4: 1})
+        self.assertEqual(stats.instructions, 3)
+
     def test_condition_failed_successor_still_resolves(self):
         o, _ = outcomes_for(["IT 000000a6 bfa8 T16 IT", "IT 000000aa 4770 T16 BX",
                              "IT 000000a2 d003 T16 BLT", "IS 000000a4 4290 T16 CMP"])
@@ -247,6 +256,21 @@ class GroundTruthTests(unittest.TestCase):
                     self.assertEqual(covered[variant], expected)
             self.assertEqual(len(expected), 31)  # 7 of 38 outcomes deliberately uncovered
 
+    def test_branch_ir_does_not_depend_on_ccfail_marking(self):
+        # es marks condition failures with CCFAIL, es-noccfail does not (some
+        # generators never do). At branch sites Ir must be the same: every
+        # execution of the branch, taken or not.
+        for core in CORES:
+            analysis = converter.analyze_branches(disassembly(core))
+            counts = {}
+            for variant in ("es", "es-noccfail"):
+                with gzip.open(str(TRACES / "branchy_{}.{}.log.gz".format(core, variant)), "rt") as trace:
+                    counts[variant], _ = converter.count_pcs(trace, outcomes=converter.BranchOutcomes(analysis))
+            for pc in analysis.sites:
+                self.assertEqual(counts["es"][pc], counts["es-noccfail"][pc], (core, hex(pc)))
+            # Condition-failed non-branch instructions still differ.
+            self.assertTrue(any(counts["es"][pc] < counts["es-noccfail"][pc] for pc in analysis.conditional))
+
 
 @unittest.skipUnless(OBJDUMP and ADDR2LINE, "needs Arm-capable objdump and addr2line")
 class OutputTests(unittest.TestCase):
@@ -290,6 +314,17 @@ class OutputTests(unittest.TestCase):
         counts, _, _, branch = converter.read_ir_profile(self.dir / "m4.es.out")
         self.assertEqual(len(branch.targets), 19)
         self.assertEqual(sum(1 for t in branch.targets.values() if t is None), 2)
+
+    def test_no_branch_keeps_the_same_ir(self):
+        with_branch, _ = self.convert("m4", "es")
+        plain, _ = self.convert("m4", "es", "--no-branch", output=self.dir / "plain_ir.out")
+
+        def ir(text):
+            return {f[0]: f[2] for f in (line.split() for line in text.splitlines())
+                    if f and f[0].startswith("0x") and len(f) >= 3}
+
+        self.assertEqual(ir(with_branch), ir(plain))
+        self.assertEqual(with_branch.splitlines()[-1].split()[1], plain.splitlines()[-1].split()[1])
 
     def test_no_branch_and_executed_only_keep_legacy_output(self):
         for option in ("--no-branch", "--executed-only"):

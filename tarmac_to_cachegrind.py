@@ -114,6 +114,10 @@ def count_pcs(
     No timestamp-based deduplication: folded and same-cycle instructions count
     independently. ES without CCFAIL is assumed executed (see README limits).
 
+    With `outcomes`, a condition-failed record (IS, ES CCFAIL) at a
+    conditional branch site counts in Ir: the branch executed and was not
+    taken. Without them, as before, every condition-failed record is excluded.
+
     With `outcomes`, each conditional branch site is resolved from the next
     instruction record that carries a PC (executed or condition-failed):
     the jump target means taken, the fallthrough means not taken, and a
@@ -185,8 +189,14 @@ def count_pcs(
                 site = sites_get(pc)
                 if site is not None:
                     if disposition:
+                        # A condition-failed branch is a not-taken branch: it
+                        # executed, so it counts in Ir like a taken one. Only
+                        # condition-failed NON-branch instructions stay out.
                         outcomes.fall[pc] += 1
-                    elif pending is None:
+                        counts[pc] += 1
+                        stats.instructions += 1
+                        continue
+                    if pending is None:
                         pending = site
                 elif disposition and pc in outcomes.conditional:
                     outcomes.conditional_skipped[pc] += 1
@@ -759,6 +769,7 @@ class ProfileContext:
     """Keep ELF instruction/source analysis and unknown-PC results across logs."""
 
     branch = None  # BranchAnalysis with at least one site, or None
+    emit_branch = True  # False with --no-branch: analyse, but write Ir only
 
     def __init__(self, args):
         self.elf = args.elf
@@ -779,9 +790,13 @@ class ProfileContext:
                 pcs = instruction_pcs(dump)
             if not pcs:
                 raise ConversionError("objdump found no executable instructions in the ELF")
-            if not args.executed_only and not getattr(args, "no_branch", False):
+            if not args.executed_only:
+                # Analysed even with --no-branch: branch sites decide how
+                # condition-failed records count in Ir, so Ir must not depend
+                # on whether the branch columns are written.
                 analysis = analyze_branches(dump, self.offset)
                 self.branch = analysis if analysis.sites else None
+            self.emit_branch = not getattr(args, "no_branch", False)
             if not args.executed_only:
                 runtime = Counter()
                 self.elf_pc_count = seed_pcs(runtime, pcs, self.offset)
@@ -1015,7 +1030,8 @@ def convert_batch_file(task, context=None, args=None):
         branch = None
         if outcomes is not None:
             outcomes.finish(counts, stats)
-            branch = BranchCounts(branch_targets(context.branch), outcomes.jump, outcomes.fall)
+            if context.emit_branch:
+                branch = BranchCounts(branch_targets(context.branch), outcomes.jump, outcomes.fall)
         mapped = time.monotonic()
         if not args.merge_only:
             with atomic_text(destination) as file:
@@ -1103,7 +1119,8 @@ def run_batch(args):
     progress("ELF analysis complete in {:.2f}s".format(time.monotonic() - started), args)
     output.mkdir(parents=True, exist_ok=True)
     total = Counter()
-    branch_total = BranchCounts.empty(branch_targets(context.branch)) if context.branch else None
+    branch_total = (BranchCounts.empty(branch_targets(context.branch))
+                    if context.branch and context.emit_branch else None)
     coverage = CoverageIndex()
     workers = min(args.workers, len(paths))
     progress("Converting with {} worker process(es)...".format(workers), args)
@@ -1157,7 +1174,7 @@ def run_batch(args):
             report["total_instructions"] += stats["instructions"]
             context.prepare(counts, Stats())  # sources for PCs outside the ELF baseline
             test_branch = (BranchCounts(branch_targets(context.branch), outcomes[0], outcomes[1])
-                           if context.branch is not None and outcomes is not None else None)
+                           if branch_total is not None and outcomes is not None else None)
             summary_rows[test_index] = (name, line_index(counts).percentage(counts),
                                         branch_percentage(test_branch))
             entry.update(status="successful", output=None if args.merge_only else name)
@@ -1589,7 +1606,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         elif not args.executed_only:
             dump = disassemble(args.elf, find_objdump(args.objdump, tool))
         outcomes = None
-        if dump is not None and not args.executed_only and not args.no_branch:
+        # Analysed even with --no-branch, so Ir does not depend on it.
+        if dump is not None and not args.executed_only:
             analysis = analyze_branches(dump, args.load_offset)
             outcomes = BranchOutcomes(analysis) if analysis.sites else None
         options = dict(input_format=args.input_format, skip_malformed=args.skip_malformed,
@@ -1616,7 +1634,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         branch = None
         if outcomes is not None:
             outcomes.finish(counts, stats)
-            branch = BranchCounts(branch_targets(outcomes), outcomes.jump, outcomes.fall)
+            if not args.no_branch:
+                branch = BranchCounts(branch_targets(outcomes), outcomes.jump, outcomes.fall)
         costs = aggregate(counts, sources, stats)
         if args.pc_counts:
             with atomic_text(args.pc_counts) as out:
