@@ -411,3 +411,93 @@ class WriterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CoverageSummaryTests(unittest.TestCase):
+    def test_line_accounting_matches_the_viewer(self):
+        # The viewer's inlined-line case (renderer/test/merge.test.mjs): line
+        # 42 sits in two functions and ran in only one, so it is both covered
+        # and uncovered: 4 covered of 5 compiled.
+        S = converter.Source
+        sources = {0x10: S("hot.c", "outer", 40), 0x12: S("hot.c", "outer", 41),
+                   0x14: S("hot.c", "outer", 42), 0x20: S("hot.c", "inlined_helper", 42),
+                   0x22: S("hot.c", "inlined_helper", 43)}
+        index = converter.LineCoverageIndex(sources)
+        self.assertAlmostEqual(index.percentage({0x10: 1, 0x12: 1, 0x14: 2, 0x22: 1}), 80.0)
+        self.assertAlmostEqual(index.percentage({}), 0.0)
+        self.assertIsNone(converter.LineCoverageIndex({}).percentage({}))
+
+    def test_branch_percentage(self):
+        self.assertIsNone(converter.branch_percentage(None))
+        self.assertIsNone(converter.branch_percentage(converter.BranchCounts.empty({})))
+        branch = converter.BranchCounts({1: 2, 3: None}, Counter({1: 4}), Counter({1: 1, 3: 2}))
+        self.assertAlmostEqual(converter.branch_percentage(branch), 75.0)
+
+    def test_summary_format(self):
+        out = io.StringIO()
+        converter.write_coverage_summary(out, [("1_a_cachegrind.out", 87.8, 81.578), ("2_b", "FAILED", "FAILED"),
+                                               ("total_merge_cachegrind.out", 100.0, None)])
+        self.assertEqual(out.getvalue().splitlines(), [
+            "file_name                   code_coverage  branch_coverage",
+            "1_a_cachegrind.out                 87.80%           81.58%",
+            "2_b                                FAILED           FAILED",
+            "total_merge_cachegrind.out        100.00%                -",
+        ])
+
+
+@unittest.skipUnless(OBJDUMP and ADDR2LINE, "needs Arm-capable objdump and addr2line")
+class CoverageSummaryOutputTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def run_main(self, *args):
+        with patch("sys.stderr", io.StringIO()):
+            return converter.main([str(a) for a in args] + ["--objdump", OBJDUMP, "--addr2line", ADDR2LINE]
+                                  if "--merge-list" not in args else [str(a) for a in args])
+
+    def rows(self, path):
+        lines = path.read_text().splitlines()
+        self.assertEqual(lines[0].split(), ["file_name", "code_coverage", "branch_coverage"])
+        return [line.split() for line in lines[1:]]
+
+    def test_single_batch_and_merge_list(self):
+        root = self.dir / "root"
+        for name, variant, head in (("full", "es", None), ("part", "it", 1500)):
+            (root / name).mkdir(parents=True)
+            with gzip.open(str(TRACES / "branchy_m4.{}.log.gz".format(variant)), "rt") as trace:
+                lines = trace.read().splitlines(True)
+            (root / name / "tarmac.log").write_text("".join(lines[:head] if head else lines))
+        (root / "bad").mkdir()
+        (root / "bad" / "tarmac.log").write_text("not a trace\n")
+        elf = FIRMWARE / "branchy_m4.elf"
+        self.assertEqual(self.run_main(root, "--elf", elf), 1)  # one log failed
+        out = root / "cachegrind-output"
+        rows = self.rows(out / "coverage_summary.txt")
+        self.assertEqual([r[0] for r in rows], ["1_bad_tarmac_cachegrind.out", "2_full_tarmac_cachegrind.out",
+                                                "3_part_tarmac_cachegrind.out", "total_merge_cachegrind.out"])
+        self.assertEqual(rows[0][1:], ["FAILED", "FAILED"])
+        self.assertEqual(rows[1][2], "81.58%")          # 31 of 38 outcomes
+        full, part, total = (float(r[1][:-1]) for r in rows[1:])
+        self.assertLess(part, full)
+        self.assertEqual(total, full)                   # part adds nothing full lacks
+        report = json.loads((out / "batch_report.json").read_text())
+        self.assertEqual(report["coverage_summary"], "coverage_summary.txt")
+
+        single = self.dir / "single.out"
+        self.assertEqual(self.run_main(root / "part" / "tarmac.log", "--elf", elf, "-o", single), 0)
+        self.assertEqual(self.rows(Path(str(single) + ".coverage_summary.txt")), [["single.out"] + rows[2][1:]])
+
+        listing = self.dir / "list.txt"
+        listing.write_text("{}\n{}\n".format(out / "2_full_tarmac_cachegrind.out", out / "3_part_tarmac_cachegrind.out"))
+        merged = self.dir / "merged.out"
+        self.assertEqual(self.run_main("--merge-list", listing, "-o", merged), 0)
+        self.assertEqual(self.rows(Path(str(merged) + ".coverage_summary.txt")),
+                         [rows[1], rows[2], ["merged.out"] + rows[3][1:]])
+
+        plain = self.dir / "plain.out"
+        self.assertEqual(self.run_main(root / "full" / "tarmac.log", "--elf", elf, "-o", plain, "--no-branch"), 0)
+        self.assertEqual(self.rows(Path(str(plain) + ".coverage_summary.txt"))[0][2], "-")

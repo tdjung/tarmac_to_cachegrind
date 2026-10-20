@@ -110,7 +110,8 @@ class BatchTests(unittest.TestCase):
             stderr=subprocess.PIPE, universal_newlines=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         output = root / "cachegrind-output"
-        self.assertEqual(len(list(output.iterdir())), 3)
+        self.assertEqual(len(list(output.iterdir())), 4)
+        self.assertTrue((output / "coverage_summary_tarmac_core0.txt").is_file())
         merged = ir_profile((output / "total_merge_tarmac_core0_cachegrind.out").read_text())
         self.assertTrue(merged.endswith("summary: 5\n"))
         self.assertNotIn("fn=never_called", merged)
@@ -200,7 +201,7 @@ class BatchTests(unittest.TestCase):
         self.assertIn('[800/800] complete "800_case399_tarmac_b_cachegrind.out"', progress.getvalue())
         self.assertIn('complete "total_merge_cachegrind.out"', progress.getvalue())
         completion_calls = [call for call in prints.call_args_list if 'complete "' in str(call[0][0])]
-        self.assertEqual(len(completion_calls), 803)  # 800 profiles, total, index, report
+        self.assertEqual(len(completion_calls), 804)  # 800 profiles, total, index, summary, report
         self.assertTrue(all(call[1].get("flush") is True for call in completion_calls))
         # One objdump plus one addr2line batch for this small ELF, not 800 each.
         self.assertEqual(calls.call_count, 2)
@@ -252,7 +253,8 @@ class BatchTests(unittest.TestCase):
             self.assertEqual(batch.main(args), 0)
             self.assertEqual(batch.main(args), 0)
         output = root / "cachegrind-output"
-        self.assertEqual({p.name for p in output.iterdir()}, {"batch_report.json", "total_merge_cachegrind.out", "coverage_index.json"})
+        self.assertEqual({p.name for p in output.iterdir()}, {"batch_report.json", "total_merge_cachegrind.out", "coverage_index.json",
+                                                             "coverage_summary.txt"})
         self.assertTrue(ir_profile((output / "total_merge_cachegrind.out").read_text()).endswith("summary: 1\n"))
 
     def test_indices_prevent_colliding_flat_names(self):

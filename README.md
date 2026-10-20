@@ -166,7 +166,9 @@ python3 tarmac_to_cachegrind.py /work/test_results \
 `--max-depth 2`를 지정하세요. 파일명 조건에 맞지 않는 파일은 파일 정보 조회를
 최소화하고, 모든 경로에 `resolve()`를 호출하지 않습니다.
 
-끝에는 **`total_merge_cachegrind.out`**, **`coverage_index.json`**, **`batch_report.json`**도 생성됩니다.
+끝에는 **`total_merge_cachegrind.out`**, **`coverage_index.json`**, **`coverage_summary.txt`**,
+**`batch_report.json`**도 생성됩니다. `coverage_summary.txt`의 형식은
+[Coverage 요약 파일](#coverage-요약-파일)을 참고하세요.
 merge는 변환 중 메모리에서 동일한 runtime PC의 `Ir`을 합산한 뒤 공유 ELF의
 파일·함수·라인에 연결합니다. 개별 출력
 파일 800개를 다시 읽는 post-merge 단계가 없습니다. 미실행 라인의 0은 유지되며,
@@ -207,11 +209,11 @@ python3 tarmac_to_cachegrind.py /work/test_results \
 두 실행에 **같은 출력 폴더**를 지정할 수 있습니다. `--log-name`을 지정한 경우
 `.log` 또는 `.log.gz`를 제거한 이름으로 merge/보고서를 구분합니다.
 
-| 선택 옵션 | 합산 파일 | 보고서 |
-|---|---|---|
-| `--log-name tarmac_core0.log` | `total_merge_tarmac_core0_cachegrind.out` | `batch_report_tarmac_core0.json` |
-| `--log-name tarmac_core1.log` | `total_merge_tarmac_core1_cachegrind.out` | `batch_report_tarmac_core1.json` |
-| 미지정 (`--pattern`만 사용한 경우 포함) | `total_merge_cachegrind.out` | `batch_report.json` |
+| 선택 옵션 | 합산 파일 | 보고서 | coverage 요약 |
+|---|---|---|---|
+| `--log-name tarmac_core0.log` | `total_merge_tarmac_core0_cachegrind.out` | `batch_report_tarmac_core0.json` | `coverage_summary_tarmac_core0.txt` |
+| `--log-name tarmac_core1.log` | `total_merge_tarmac_core1_cachegrind.out` | `batch_report_tarmac_core1.json` | `coverage_summary_tarmac_core1.txt` |
+| 미지정 (`--pattern`만 사용한 경우 포함) | `total_merge_cachegrind.out` | `batch_report.json` | `coverage_summary.txt` |
 
 같은 코어를 다시 실행하면 이번에 생성하는 개별 파일·합산·목록·보고서를 교체합니다. 기존 결과에
 중복 누적하지 않습니다. `--log-name`으로 `.log`와 그 압축본 `.log.gz`를 각각 실행하면
@@ -465,6 +467,37 @@ Completed: 800 succeeded, 0 failed; ...
 `-o`는 단일 모드에서 출력 파일, 폴더 모드에서 출력 디렉터리입니다. 배치에서는
 `--output-dir`도 사용할 수 있습니다. `--pc-counts`, `--stats`, `--skip-malformed`는
 단일 로그 전용이며 배치는 `batch_report.json`에 파일별 통계를 기록합니다.
+
+## Coverage 요약 파일
+
+변환할 때마다 프로파일별 code coverage와 branch coverage를 한 파일에 정리합니다.
+
+```text
+file_name                           code_coverage  branch_coverage
+1_broken_tarmac_cachegrind.out             FAILED           FAILED
+2_full_es_tarmac_cachegrind.out            88.10%           81.58%
+5_part_1500_tarmac_cachegrind.out          40.48%           36.84%
+total_merge_cachegrind.out                 88.10%           81.58%
+```
+
+| 모드 | 파일 | 행 |
+|---|---|---|
+| 일괄 변환 | 출력 폴더의 `coverage_summary[_태그].txt` | 개별 출력 파일마다 한 행(번호 순), 맨 아래 total merge |
+| 단일 로그 | `<출력 파일>.coverage_summary.txt` | 출력 파일 한 행 |
+| `--merge-list` | `<출력 파일>.coverage_summary.txt` | 입력 파일마다 한 행, 맨 아래 merge 결과 |
+
+- **숫자는 performance profiler 화면과 같습니다.** code coverage는 Overview의 Overall
+  Coverage와, branch coverage는 Branch Coverage와 같은 방식으로 계산합니다.
+- **code coverage:** 실행된 라인 / 컴파일된 라인입니다. 실행 여부는 `Ir > 0`으로 판단하며
+  branch 이벤트는 쓰지 않습니다. 뷰어와 같게, 라인은 (파일, 함수, 라인)마다 세고 `???`도
+  포함합니다. 그래서 inline 코드처럼 두 함수에 걸친 라인은 한쪽에서만 실행됐으면 분모에
+  두 번 들어갑니다.
+- **branch coverage:** 커버된 outcome / (조건 분기 수 × 2)입니다.
+- **`-`와 `FAILED`:** `--no-branch`, `--executed-only`, 분기가 없는 ELF처럼 계산할 수 없으면
+  `-`로 표시합니다. 변환에 실패한 로그는 `FAILED`로 표시하고 total에서 빠집니다.
+- `--merge-only`에서도 개별 출력 파일 이름으로 행을 만듭니다(파일 자체는 쓰지 않습니다).
+- 일괄 변환에서 라인 구조는 한 번만 만들고 로그마다 실행된 PC만 확인하므로, 로그가
+  많아도 추가 시간은 작습니다.
 
 ## 기존 결과에서 일부 테스트만 선택해 다시 merge
 
@@ -908,7 +941,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 Python 3.6.8 및 3.12.14 인터프리터에서 아래 66개 테스트의 통과를 확인했습니다.
-branch coverage와 inline 귀속 테스트를 더한 90개는 Python 3.13에서 확인했습니다.
+branch coverage, inline 귀속, coverage 요약 테스트를 더한 94개는 Python 3.13에서 확인했습니다.
 `dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,

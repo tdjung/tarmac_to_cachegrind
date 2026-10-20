@@ -625,6 +625,79 @@ def branch_row(prefix, pc, branch, target_line):
     return head + position, " {} {} 1".format(jump + fall, fall)
 
 
+class LineCoverageIndex:
+    """Code coverage exactly as the performance profiler computes it.
+
+    The viewer keeps one line entry per (file, function, line). Per file, a
+    line goes into the covered set if it ran in some function and into the
+    uncovered set if it did not run in some function; compiled lines are the
+    sizes of both sets added (so a line shared by two functions, as inlined
+    code is, can count twice). Project coverage is covered / compiled over
+    all files, `???` included. "Ran" means Ir > 0; branch events never count.
+
+    Built once per set of output rows; each profile then costs only its
+    executed PCs, which keeps per-log summaries cheap in large batches.
+    """
+
+    def __init__(self, sources: Dict[int, Source]):
+        self.key_of = {}  # type: Dict[int, Tuple[str, str, int]]
+        variants = Counter()  # type: CounterType[Tuple[str, int]]
+        for pc, source in sources.items():
+            key = (source.file, source.function, source.line)
+            self.key_of[pc] = key
+        for file, _function, line in set(self.key_of.values()):
+            variants[(file, line)] += 1
+        self.variants = variants
+        self.lines = len(variants)
+
+    def percentage(self, counts) -> Optional[float]:
+        executed = set()
+        for pc, count in counts.items():
+            if count > 0:
+                key = self.key_of.get(pc)
+                if key is not None:
+                    executed.add(key)
+        ran = Counter((file, line) for file, _function, line in executed)
+        covered = len(ran)
+        # Every distinct (file, line) is counted once; a line that ran in some
+        # but not all of its functions is also in the uncovered set.
+        compiled = self.lines + sum(1 for key, n in ran.items() if n < self.variants[key])
+        return 100.0 * covered / compiled if compiled else None
+
+
+def branch_percentage(branch: Optional[BranchCounts]) -> Optional[float]:
+    """Outcomes reached over 2 x conditional branch sites, as the viewer shows it."""
+    if not branch or not branch.targets:
+        return None
+    covered = sum(1 for pc in branch.targets if branch.jump.get(pc, 0) > 0)
+    covered += sum(1 for pc in branch.targets if branch.fall.get(pc, 0) > 0)
+    return 100.0 * covered / (2 * len(branch.targets))
+
+
+SUMMARY_COLUMNS = ("file_name", "code_coverage", "branch_coverage")
+
+
+def write_coverage_summary(out: TextIO, rows) -> None:
+    """One row per profile: name, code coverage %, branch coverage %.
+
+    `-` means not measurable (no compiled lines, or no branch events);
+    FAILED marks a log that did not convert. The last row of a batch or
+    merge is the merged total.
+    """
+    def cell(value):
+        if value is None:
+            return "-"
+        if isinstance(value, str):
+            return value
+        return "{:.2f}%".format(value)
+
+    names = [one_line(row[0]) for row in rows]
+    width = max([len(SUMMARY_COLUMNS[0])] + [len(name) for name in names])
+    out.write("{:<{w}}  {:>13}  {:>15}\n".format(*SUMMARY_COLUMNS, w=width))
+    for name, (_name, code, branch) in zip(names, rows):
+        out.write("{:<{w}}  {:>13}  {:>15}\n".format(name, cell(code), cell(branch), w=width))
+
+
 def write_cachegrind(out: TextIO, costs: CounterType[Position], elf: Path,
                      branch: Optional[BranchCounts] = None) -> None:
     """Write the requested instruction-address and source-line profile format."""
@@ -1059,6 +1132,7 @@ def run_batch(args):
             tag = tag[:-4]
         tag = "_" + tag
     merge_name = "total_merge" + tag + "_cachegrind.out"
+    summary_name = "coverage_summary" + tag + ".txt"
     report_name = "batch_report" + tag + ".json"
     index_name = "coverage_index" + tag + ".json"
     manifest = [{"index": indices[path], "input": str(path.relative_to(root)),
@@ -1069,8 +1143,20 @@ def run_batch(args):
               "merged_output": None, "max_depth": args.max_depth, "partial_merge": False,
               "log_name": args.log_name, "preserved_previous_outputs": [],
               "workers": workers, "merge_seconds": 0.0, "coverage_seconds": 0.0,
-              "coverage_index": None}
+              "coverage_index": None, "coverage_summary": None}
     tasks = [(path, output / name) for path, name in zip(paths, names)]
+    base_index = LineCoverageIndex({position.pc: Source(*position[1:]) for position in context.baseline})
+    summary_rows = {}  # test index -> (name, code %, branch %)
+
+    def line_index(counts):
+        # Rows of this profile: the ELF baseline plus any PCs outside it.
+        extras = [pc for pc in counts if pc not in context.baseline_pcs]
+        if not extras:
+            return base_index
+        sources = {position.pc: Source(*position[1:]) for position in context.baseline}
+        sources.update({pc: context.sources[pc] for pc in extras})
+        return LineCoverageIndex(sources)
+
     for index, result in enumerate(batch_results(tasks, context, args, workers), 1):
         path, name, counts, stats, timings, error, outcomes = result
         test_index = indices[path]
@@ -1085,6 +1171,11 @@ def run_batch(args):
             report["coverage_seconds"] += time.monotonic() - coverage_started
             report["merge_seconds"] += time.monotonic() - merge_started
             report["total_instructions"] += stats["instructions"]
+            context.prepare(counts, Stats())  # sources for PCs outside the ELF baseline
+            test_branch = (BranchCounts(branch_targets(context.branch), outcomes[0], outcomes[1])
+                           if context.branch is not None and outcomes is not None else None)
+            summary_rows[test_index] = (name, line_index(counts).percentage(counts),
+                                        branch_percentage(test_branch))
             entry.update(status="successful", output=None if args.merge_only else name)
             report["successful"].append({"input": str(path.relative_to(root)), "index": test_index,
                                          "output": None if args.merge_only else name,
@@ -1094,6 +1185,7 @@ def run_batch(args):
             progress("[{}/{}] {} {}".format(index, len(paths), action, json.dumps(label, ensure_ascii=False)), args)
         else:
             entry.update(status="failed", error=error)
+            summary_rows[test_index] = (name, "FAILED", "FAILED")
             report["failed"].append({"input": str(path.relative_to(root)), "index": test_index, "error": error})
             if not args.merge_only and (output / name).exists():
                 report["preserved_previous_outputs"].append(name)
@@ -1129,6 +1221,12 @@ def run_batch(args):
             print("warning: PARTIAL MERGE: {} logs failed; see {}".format(len(report["failed"]), report_name), file=sys.stderr, flush=True)
         report["merged_output"] = name
         progress("complete " + json.dumps(name), args)
+        rows = [summary_rows[i] for i in sorted(summary_rows)]
+        rows.append((merge_name, line_index(total).percentage(total), branch_percentage(branch_total)))
+        with atomic_text(output / summary_name) as file:
+            write_coverage_summary(file, rows)
+        report["coverage_summary"] = summary_name
+        progress("complete " + json.dumps(summary_name), args)
     if not report["successful"] and (output / merge_name).exists():
         report["preserved_previous_outputs"].append(merge_name)
         print("warning: all logs failed; previous merge was not updated: " + merge_name, file=sys.stderr, flush=True)
@@ -1317,7 +1415,8 @@ def run_profile_merge(args):
     output = args.output.resolve()
     index_path = output.with_name(output.name + ".coverage_index.json")
     report_path = output.with_name(output.name + ".merge_report.json")
-    outputs = {output, index_path, report_path}
+    summary_path = output.with_name(output.name + ".coverage_summary.txt")
+    outputs = {output, index_path, report_path, summary_path}
     lists = [listing] + ([args.exclude_list.resolve()] if args.exclude_list else [])
     for destination in outputs:
         if destination.is_dir() or not destination.parent.is_dir():
@@ -1352,6 +1451,7 @@ def run_profile_merge(args):
     coverage = CoverageIndex([index for index, _ in entries])
     total, sources, obj, manifest = Counter(), {}, None, []
     branch = None
+    summary_rows, indexes = [], {}
     progress("[0/{}] merging existing profiles".format(len(entries)), args)
     for internal_index, (test_index, path) in enumerate(entries, 1):
         counts, mapping, current_obj, profile_branch = read_ir_profile(path)
@@ -1374,6 +1474,12 @@ def run_profile_merge(args):
                 raise ConversionError("{}: conflicting source mapping at PC 0x{:x}".format(path, pc))
         sources.update(mapping)
         total.update(counts)
+        # Coverage of this profile over its own rows. Profiles of one ELF share
+        # their rows, so the line index is normally built once.
+        rows_key = frozenset(mapping)
+        if rows_key not in indexes:
+            indexes[rows_key] = LineCoverageIndex(mapping)
+        summary_rows.append((path.name, indexes[rows_key].percentage(counts), branch_percentage(profile_branch)))
         coverage.add(internal_index, counts)
         manifest.append({"index": test_index, "input": str(path), "output": str(path),
                          "status": "successful", "instructions": sum(counts.values())})
@@ -1398,14 +1504,18 @@ def run_profile_merge(args):
                        "assembly_guidance": "only Ir is an instruction-level metric; other events are source-line metadata",
                        "sets": coverage.sets}, index_file, indent=2, sort_keys=True)
             index_file.write("\n")
+    summary_rows.append((output.name, LineCoverageIndex(sources).percentage(total), branch_percentage(branch)))
+    with atomic_text(summary_path) as file:
+        write_coverage_summary(file, summary_rows)
     report = {"mode": "merge_list", "selection_list": str(listing), "merged": len(entries),
               "total_instructions": sum(total.values()), "merged_output": str(output),
-              "coverage_index": str(index_path), "indices_preserved": not args.reindex,
+              "coverage_index": str(index_path), "coverage_summary": str(summary_path),
+              "indices_preserved": not args.reindex,
               "inputs": manifest, "elapsed_seconds": time.monotonic() - started}
     with atomic_text(report_path) as file:
         json.dump(report, file, indent=2, sort_keys=True)
         file.write("\n")
-    for path in (output, index_path, report_path):
+    for path in (output, index_path, report_path, summary_path):
         progress("complete " + json.dumps(str(path), ensure_ascii=False), args)
     return 0
 
@@ -1538,7 +1648,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                 out.write("\n")
         with atomic_text(args.output) as out:
             write_cachegrind(out, costs, args.elf, branch)
+        summary_path = args.output.with_name(args.output.name + ".coverage_summary.txt")
+        with atomic_text(summary_path) as out:
+            write_coverage_summary(out, [(args.output.name, LineCoverageIndex(sources).percentage(counts),
+                                          branch_percentage(branch))])
         print("complete " + json.dumps(str(args.output), ensure_ascii=False), file=sys.stderr, flush=True)
+        print("complete " + json.dumps(str(summary_path), ensure_ascii=False), file=sys.stderr, flush=True)
         print(f"{stats.instructions:,} instructions, {stats.unique_pcs:,} unique PCs -> {args.output}", file=sys.stderr)
         if not stats.instructions:
             print("warning: no executed instructions found; output contains only zero-cost ELF locations", file=sys.stderr)
