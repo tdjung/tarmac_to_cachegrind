@@ -488,10 +488,10 @@ total_merge_cachegrind.out                 88.10%           81.58%
 
 - **숫자는 performance profiler 화면과 같습니다.** code coverage는 Overview의 Overall
   Coverage와, branch coverage는 Branch Coverage와 같은 방식으로 계산합니다.
-- **code coverage:** 실행된 라인 / 컴파일된 라인입니다. 실행 여부는 `Ir > 0`으로 판단하며
-  branch 이벤트는 쓰지 않습니다. 뷰어와 같게, 라인은 (파일, 함수, 라인)마다 세고 `???`도
-  포함합니다. 그래서 inline 코드처럼 두 함수에 걸친 라인은 한쪽에서만 실행됐으면 분모에
-  두 번 들어갑니다.
+- **code coverage:** 실행된 라인 / 컴파일된 라인입니다. 라인은 (파일, 라인)마다 한 번 세고,
+  그 라인의 PC 중 하나라도 실행(`Ir > 0`)됐으면 커버입니다. inline 코드처럼 여러 함수에 걸친
+  라인도 한 라인이며, 어느 함수에서든 실행됐으면 커버입니다. branch 이벤트는 실행 여부에 쓰지
+  않고, `???`도 포함합니다. 함수별·파일별 %도 같은 방식으로 각각 계산합니다.
 - **branch coverage:** 커버된 outcome / (조건 분기 수 × 2)입니다.
 - **`-`와 `FAILED`:** `--no-branch`, `--executed-only`, 분기가 없는 ELF처럼 계산할 수 없으면
   `-`로 표시합니다. 변환에 실패한 로그는 `FAILED`로 표시하고 total에서 빠집니다.

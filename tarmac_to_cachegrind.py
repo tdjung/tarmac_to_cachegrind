@@ -628,41 +628,25 @@ def branch_row(prefix, pc, branch, target_line):
 class LineCoverageIndex:
     """Code coverage exactly as the performance profiler computes it.
 
-    The viewer keeps one line entry per (file, function, line). Per file, a
-    line goes into the covered set if it ran in some function and into the
-    uncovered set if it did not run in some function; compiled lines are the
-    sizes of both sets added (so a line shared by two functions, as inlined
-    code is, can count twice). Project coverage is covered / compiled over
-    all files, `???` included. "Ran" means Ir > 0; branch events never count.
+    One entry per source line, (file, line): covered if any PC on that line,
+    in any function, ran (Ir > 0; branch events never count). Coverage is
+    covered lines / all lines over every file, `???` included. A line that
+    inlined code puts into several functions is still one line.
 
     Built once per set of output rows; each profile then costs only its
     executed PCs, which keeps per-log summaries cheap in large batches.
     """
 
     def __init__(self, sources: Dict[int, Source]):
-        self.key_of = {}  # type: Dict[int, Tuple[str, str, int]]
-        variants = Counter()  # type: CounterType[Tuple[str, int]]
-        for pc, source in sources.items():
-            key = (source.file, source.function, source.line)
-            self.key_of[pc] = key
-        for file, _function, line in set(self.key_of.values()):
-            variants[(file, line)] += 1
-        self.variants = variants
-        self.lines = len(variants)
+        self.line_of = {pc: (source.file, source.line) for pc, source in sources.items()}
+        self.lines = len(set(self.line_of.values()))
 
     def percentage(self, counts) -> Optional[float]:
-        executed = set()
-        for pc, count in counts.items():
-            if count > 0:
-                key = self.key_of.get(pc)
-                if key is not None:
-                    executed.add(key)
-        ran = Counter((file, line) for file, _function, line in executed)
-        covered = len(ran)
-        # Every distinct (file, line) is counted once; a line that ran in some
-        # but not all of its functions is also in the uncovered set.
-        compiled = self.lines + sum(1 for key, n in ran.items() if n < self.variants[key])
-        return 100.0 * covered / compiled if compiled else None
+        if not self.lines:
+            return None
+        line_of = self.line_of
+        covered = {line_of[pc] for pc, count in counts.items() if count > 0 and pc in line_of}
+        return 100.0 * len(covered) / self.lines
 
 
 def branch_percentage(branch: Optional[BranchCounts]) -> Optional[float]:

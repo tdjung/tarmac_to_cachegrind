@@ -416,14 +416,16 @@ if __name__ == "__main__":
 class CoverageSummaryTests(unittest.TestCase):
     def test_line_accounting_matches_the_viewer(self):
         # The viewer's inlined-line case (renderer/test/merge.test.mjs): line
-        # 42 sits in two functions and ran in only one, so it is both covered
-        # and uncovered: 4 covered of 5 compiled.
+        # 42 sits in two functions and ran in only one. It is one line, and
+        # it ran: 4 covered of 4.
         S = converter.Source
         sources = {0x10: S("hot.c", "outer", 40), 0x12: S("hot.c", "outer", 41),
                    0x14: S("hot.c", "outer", 42), 0x20: S("hot.c", "inlined_helper", 42),
                    0x22: S("hot.c", "inlined_helper", 43)}
         index = converter.LineCoverageIndex(sources)
-        self.assertAlmostEqual(index.percentage({0x10: 1, 0x12: 1, 0x14: 2, 0x22: 1}), 80.0)
+        self.assertAlmostEqual(index.percentage({0x10: 1, 0x12: 1, 0x14: 2, 0x22: 1}), 100.0)
+        # Without the helper's own lines: 40, 41, 42 of 40..43.
+        self.assertAlmostEqual(index.percentage({0x10: 1, 0x12: 1, 0x20: 1}), 75.0)
         self.assertAlmostEqual(index.percentage({}), 0.0)
         self.assertIsNone(converter.LineCoverageIndex({}).percentage({}))
 
