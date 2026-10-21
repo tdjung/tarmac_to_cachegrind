@@ -742,6 +742,51 @@ inline 계층마다 비용을 늘리지 않습니다. inline 본문이 다른 �
 `fl=` 아래에 같은 함수 이름으로 기록됩니다. 최적화로 인한 라인 매핑의 모호함, 심볼 alias,
 별도 이미지/overlay, self-modifying code를 복원하지 않습니다.
 
+### 소스 라인이 없는 명령어 (line 0)
+
+최적화된 코드에는 디버그 정보(DWARF)가 **line 0**, 즉 "어느 소스 라인에도 속하지 않음"으로
+기록한 명령어가 있습니다. 여러 라인이 함께 쓰는 코드, 라인 경계를 넘어 옮겨진 코드,
+inline 본문의 경계 등이 해당하며 clang에서 특히 많습니다. `addr2line`은 이런 주소를
+`file.c:?`나 `??:0`으로 보고하고, `objdump -l`은 위치를 출력하지 않아 **바로 위 라인에
+이어지는 것처럼** 보입니다.
+
+```text
+B():
+file.c:938
+    10:  ...
+    12:  ...
+    14:  ...
+A():                ← 위치 표시 없음: line 0
+    16:  ...           (addr2line: B / file.c:?, A / file.c:1039)
+    18:  ...
+    1a:  ...
+```
+
+그대로 두면 이 명령어들은 라인 0으로 기록되어 938 라인의 Ir, coverage, 분기 표시에서
+빠집니다. 변환기는 다음 순서로 라인을 정합니다.
+
+| 순서 | 조건 | 받는 라인 | 예 |
+|---|---|---|---|
+| previous | 바로 앞 명령어가 이 명령어로 이어서 실행되고, 같은 (inline) 함수 | 앞 명령어의 라인 | 16~1a → 938 |
+| next | 앞이 무조건 `b`, `bx`, `pop {..pc}`, `ldr/mov pc`, `tbb/tbh`라 다른 곳에서 점프해 들어오는 코드 | 이어지는 같은 (inline) 함수 명령어 중 첫 라인 | 점프 대상의 준비 코드 |
+| call_site | inline 함수 안에서 앞뒤로 라인을 찾지 못함 | 그 함수를 호출한 라인 (addr2line 다음 frame) | → 1039 |
+| unresolved | 위 모두 해당 없음 (정렬 padding 등) | 0 유지 | |
+
+- 조건 분기나 IT 블록 안의 조건부 `bx` 뒤는 이어서 실행될 수 있으므로 previous를 적용합니다.
+- **다른 inline 함수의 라인은 이어받지 않습니다.** inline된 B의 코드가 A의 라인을 받거나,
+  그 반대가 되지 않습니다. 함수(`fn=`)는 바뀌지 않고 라인과 파일만 정합니다.
+- `??:0`처럼 파일도 모르면 파일도 함께 받습니다.
+- `--executed-only`에서도 결과가 같습니다. 필요한 이웃 명령어는 실행 여부와 관계없이
+  addr2line으로 풀어서 사용하므로, trace에 따라 라인이 달라지지 않습니다.
+- 처리 결과는 stderr에 `info: N instructions have no source line (line 0) ...; placed by
+  previous a, next b, call site c, unresolved d`로 출력하고, 배치에서는
+  `batch_report.json`의 `line_zero_placement`에도 기록합니다. unresolved만 기존처럼
+  "instructions without source lines" 경고에 포함됩니다.
+
+line 0은 원래 정답이 없는 정보이므로 이 규칙은 objdump 화면과 실행 순서에 맞춘
+추정입니다. objdump fallback(addr2line 없음)은 objdump가 위치를 출력하지 않는 명령어에
+위 라인을 그대로 적용하므로, previous 규칙만 흐름과 inline 구분 없이 적용한 것과 같습니다.
+
 ### addr2line이 없는 환경
 
 `--addr2line`을 생략하면 기존 순서로 자동 탐색합니다. 모두 없으면 stderr에 전환
@@ -944,7 +989,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 Python 3.6.8 및 3.12.14 인터프리터에서 아래 66개 테스트의 통과를 확인했습니다.
-branch coverage, inline 귀속, coverage 요약 테스트를 더한 94개는 Python 3.13에서 확인했습니다.
+branch coverage, inline 귀속, coverage 요약, line 0 배치 테스트를 더한 108개는 Python 3.13에서 확인했습니다.
 `dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,
@@ -976,6 +1021,9 @@ branch coverage, inline 귀속, coverage 요약 테스트를 더한 94개는 Pyt
   `--merge-list` 결과 일치, 혼합/변조 프로파일 거부, inline 코드의 함수 귀속(실제
   Arm ELF, GNU/LLVM addr2line)을 검증합니다. Arm용 objdump/addr2line이
   없으면 해당 테스트는 skip됩니다.
+- Line 0 배치: 흐름이 끊기는 명령어 판정, 규칙별 결과, inline 함수 경계, `??:0`, 이웃
+  명령어의 지연 해석, 실제 clang ELF(`tests/firmware/line0.c`)에서 inline 본문 안의
+  line 0이 본문 라인으로 가는지, 일반/`--executed-only` 출력이 같은지를 검증합니다.
 
 ELF 통합 테스트에는 `gcc`, `nm`, `addr2line`, `objdump`가 필요하며 없으면 해당 테스트가
 skip됩니다. 테스트는 호스트에서 컴파일한 ELF 주소에 합성 Tarmac 이벤트를 연결하는

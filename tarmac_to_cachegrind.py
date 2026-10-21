@@ -231,9 +231,19 @@ def find_addr2line(explicit: Optional[str]) -> Optional[str]:
     )
 
 
+InlineFrame = namedtuple("InlineFrame", "function call_file call_line")
+"""Innermost function at a PC (the inlined one, else the containing one) and,
+for inlined code, the source line that made the call (call_line 0 if none)."""
+
+
+def _known_name(name: str) -> str:
+    return name if name not in ("", "??", "???") else "???"
+
+
 def resolve_pcs(
     pcs: Iterable[int], elf: Path, tool: str, *, load_offset: int = 0,
     batch_size: int = 4096, timeout: float = 120,
+    inline: Optional[Dict[int, InlineFrame]] = None,
 ) -> Dict[int, Source]:
     """Resolve unique PCs in bounded stdin batches, never one process per hit.
 
@@ -248,7 +258,8 @@ def resolve_pcs(
 
     Each PC is attributed once; counts are never multiplied for inlining.
     `-a` prints each query address first, which delimits the variable-length
-    frame lists.
+    frame lists. If `inline` is given, it receives each PC's InlineFrame, which
+    attribute_line_zero uses to place instructions the compiler gave line 0.
     """
     if batch_size < 1:
         raise ConversionError("batch size must be positive")
@@ -298,10 +309,18 @@ def resolve_pcs(
                 raise ConversionError(f"unexpected addr2line source location: {location!r}")
             filename, line_number = match.groups()
             sources[pc] = Source(
-                file=filename if filename not in ("", "??", "???") else "???",
-                function=function if function not in ("", "??", "???") else "???",
+                file=_known_name(filename),
+                function=_known_name(function),
                 line=int(line_number) if line_number != "?" else 0,
             )
+            if inline is not None:
+                call_file, call_line = "???", 0
+                if len(frames) > 1:
+                    call = LOCATION.fullmatch(frames[1][1])
+                    if call and call.group(2) != "?":
+                        call_file, call_line = _known_name(call.group(1)), int(call.group(2))
+                inline[pc] = InlineFrame(_known_name(frames[0][0]), call_file,
+                                         call_line if call_file != "???" else 0)
         if position != len(output):
             raise ConversionError("unexpected addr2line output: trailing lines")
     return sources
@@ -511,6 +530,155 @@ def analyze_branches(disassembly: str, load_offset: int = 0) -> BranchAnalysis:
         sites[site_pc + load_offset] = BranchSite(
             site_pc + load_offset, None if target is None else target + load_offset, None, kind)
     return BranchAnalysis(sites, frozenset(conditional), frozenset(entries))
+
+
+# --- Instructions the compiler gave no source line (line 0) ---
+#
+# Optimised code contains instructions DWARF assigns to line 0: code shared by
+# several lines, hoisted or scheduled across a line boundary, or at the edge
+# of an inlined body. addr2line reports them as `file.c:?` or `??:0`, and
+# `objdump -l` prints no location for them, so they look like part of the
+# line above. Left at line 0 they vanish from every source line. They are
+# placed instead, in this order:
+#   previous   the instruction before falls through into this one and is in
+#              the same (inlined) function: take its line, as objdump shows it
+#   next       otherwise the next instruction of this straight-line run in the
+#              same (inlined) function, e.g. set-up at a jump target
+#   call_site  inlined code with no line in that function: the line that
+#              called it (addr2line's next frame)
+#   unresolved none of these: line 0 is kept
+ENDS_FLOW = re.compile(r"^(?:b|bx|bxns|tbb|tbh)(?:\.[nw])?$")
+ENDS_FLOW_LOAD = re.compile(r"^(?:pop|ldm|ldmia|ldmfd|ldmdb|ldmea)(?:\.[nw])?$")
+ENDS_FLOW_MOVE = re.compile(r"^(?:ldr|mov)(?:\.[nw])?$")
+LINE_ZERO_RULES = ("previous", "next", "call_site", "unresolved")
+LINE_ZERO_RUN_LIMIT = 256  # instructions searched forward for the "next" rule
+
+
+def ends_flow(mnemonic: str, operands: str) -> bool:
+    """True if execution never continues to the next instruction: an
+    unconditional jump, return or table branch. Conditional forms (including
+    those inside IT blocks, which carry a condition suffix) fall through."""
+    mnemonic, operands = mnemonic.lower(), operands.lower()
+    if ENDS_FLOW.match(mnemonic):
+        return True
+    if ENDS_FLOW_LOAD.match(mnemonic):
+        return bool(re.search(r"\bpc\b", operands.split("{", 1)[-1]))
+    if ENDS_FLOW_MOVE.match(mnemonic):
+        return operands.split(",", 1)[0].strip() == "pc"
+    return False
+
+
+class Listing:
+    """Instruction order from objdump: neighbours within one symbol, and
+    whether each instruction can continue into the next. Runtime addresses."""
+
+    def __init__(self, disassembly: str = "", load_offset: int = 0):
+        self.prev = {}  # type: Dict[int, int]
+        self.next = {}  # type: Dict[int, int]
+        self.falls = {}  # type: Dict[int, bool]
+        last = None
+        for raw in disassembly.splitlines():
+            if raw.startswith("Disassembly of section ") or SYMBOL.match(raw.strip()):
+                last = None
+                continue
+            match = LISTING.match(raw)
+            if not match:
+                continue
+            mnemonic, operands = match.group(2), match.group(3) or ""
+            if is_data(mnemonic, operands):
+                last = None
+                continue
+            pc = int(match.group(1), 16) + load_offset
+            if last is not None:
+                self.prev[pc], self.next[last] = last, pc
+            self.falls[pc] = not ends_flow(mnemonic, operands)
+            last = pc
+
+    def neighbours(self, pc: int) -> List[int]:
+        """The PCs attribute_line_zero may look at for `pc`."""
+        found = []
+        if pc in self.prev:
+            found.append(self.prev[pc])
+        cur = pc
+        for _ in range(LINE_ZERO_RUN_LIMIT):
+            if not self.falls.get(cur) or cur not in self.next:
+                break
+            cur = self.next[cur]
+            found.append(cur)
+        return found
+
+
+def needs_line(source: Source) -> bool:
+    return source.line <= 0 or source.file == "???"
+
+
+def attribute_line_zero(sources: Dict[int, Source], inline: Dict[int, InlineFrame],
+                        listing: Listing, targets: Optional[Iterable[int]] = None,
+                        resolve_more=None) -> CounterType[str]:
+    """Give line-0 instructions a line (rules above); returns a count per rule.
+
+    `targets` limits the PCs placed (default: every line-0 PC in `sources`).
+    `resolve_more(pcs)` adds sources and inline frames for neighbours that are
+    not resolved yet (--executed-only), so the result never depends on which
+    instructions a trace happened to execute.
+    """
+    pending = sorted(pc for pc in (sources if targets is None else targets)
+                     if pc in sources and needs_line(sources[pc]))
+    placed = Counter()  # type: CounterType[str]
+    if not pending:
+        return placed
+    if resolve_more is not None:
+        wanted = {n for pc in pending for n in listing.neighbours(pc)}.difference(sources)
+        if wanted:
+            resolve_more(wanted)
+
+    def inner(pc):
+        frame = inline.get(pc)
+        return frame.function if frame else "???"
+
+    def same_function(a, b):
+        x, y = inner(a), inner(b)
+        return x == "???" or y == "???" or x == y
+
+    def place(pc, file, line, function, rule):
+        own = sources[pc]
+        sources[pc] = Source(file, own.function if own.function != "???" else function, line)
+        placed[rule] += 1
+
+    # Ascending order: a run of line-0 instructions inherits through itself.
+    for pc in pending:
+        prev = listing.prev.get(pc)
+        if (prev is not None and listing.falls.get(prev) and prev in sources
+                and same_function(prev, pc) and not needs_line(sources[prev])):
+            source = sources[prev]
+            place(pc, source.file, source.line, source.function, "previous")
+            continue
+        found, cur = None, pc
+        for _ in range(LINE_ZERO_RUN_LIMIT):
+            nxt = listing.next.get(cur)
+            if not listing.falls.get(cur) or nxt is None or nxt not in sources or not same_function(nxt, pc):
+                break
+            if not needs_line(sources[nxt]):
+                found = sources[nxt]
+                break
+            cur = nxt
+        if found is not None:
+            place(pc, found.file, found.line, found.function, "next")
+            continue
+        frame = inline.get(pc)
+        if frame is not None and frame.call_line > 0:
+            place(pc, frame.call_file, frame.call_line, "???", "call_site")
+            continue
+        placed["unresolved"] += 1
+    return placed
+
+
+def line_zero_message(placed: CounterType[str]) -> Optional[str]:
+    if not placed:
+        return None
+    total = sum(placed.values())
+    parts = ", ".join(f"{rule.replace('_', ' ')} {placed[rule]:,}" for rule in LINE_ZERO_RULES)
+    return f"info: {total:,} instructions have no source line (line 0) in the debug info; placed by {parts}"
 
 
 class BranchOutcomes:
@@ -776,12 +944,18 @@ class ProfileContext:
         self.offset = args.load_offset
         self.addr2line = find_addr2line(args.addr2line)
         self.sources = {}
+        self.inline = {}  # type: Dict[int, InlineFrame]
+        self.listing = None  # Listing, built when a line-0 instruction needs it
+        self.dump = None
+        self.objdump = args.objdump
+        self.line_zero = Counter()  # type: CounterType[str]
         self.baseline = Counter()
         self.elf_pc_count = 0
         self.fallback = None
         if not args.executed_only or self.addr2line is None:
             objdump = find_objdump(args.objdump, self.addr2line)
             dump = disassemble(self.elf, objdump, with_lines=self.addr2line is None)
+            self.dump = dump
             if self.addr2line is None:
                 print("info: addr2line not found; using objdump -l", file=sys.stderr)
                 self.fallback = objdump_sources(dump)
@@ -801,6 +975,9 @@ class ProfileContext:
                 runtime = Counter()
                 self.elf_pc_count = seed_pcs(runtime, pcs, self.offset)
                 self.resolve(runtime)
+                # Every ELF instruction is placed now. Later PCs are outside
+                # the ELF, so keep no listing (it would be copied to workers).
+                self.listing, self.dump = Listing(), None
                 for pc, source in self.sources.items():
                     self.baseline[Position(pc, *source)] = 0
         self.layout = self.make_layout(self.baseline)
@@ -865,7 +1042,16 @@ class ProfileContext:
             raise ConversionError("--load-offset produces a negative ELF address")
         if self.addr2line is not None:
             self.sources.update(resolve_pcs(
-                missing, self.elf, self.addr2line, load_offset=self.offset))
+                missing, self.elf, self.addr2line, load_offset=self.offset, inline=self.inline))
+            if any(needs_line(self.sources[pc]) for pc in missing):
+                if self.listing is None:
+                    if self.dump is None:  # --executed-only did not disassemble
+                        self.dump = disassemble(self.elf, find_objdump(self.objdump, self.addr2line))
+                    self.listing = Listing(self.dump, self.offset)
+                more = (lambda pcs: self.sources.update(resolve_pcs(
+                    pcs, self.elf, self.addr2line, load_offset=self.offset, inline=self.inline)))
+                self.line_zero.update(attribute_line_zero(
+                    self.sources, self.inline, self.listing, targets=missing, resolve_more=more))
         else:
             self.sources.update({pc: self.fallback.get(pc - self.offset, Source())
                                  for pc in missing})
@@ -1117,6 +1303,10 @@ def run_batch(args):
     started = time.monotonic()
     context = ProfileContext(args)
     progress("ELF analysis complete in {:.2f}s".format(time.monotonic() - started), args)
+    reported_line_zero = Counter(context.line_zero)
+    message = line_zero_message(reported_line_zero)
+    if message:
+        print(message, file=sys.stderr)
     output.mkdir(parents=True, exist_ok=True)
     total = Counter()
     branch_total = (BranchCounts.empty(branch_targets(context.branch))
@@ -1236,6 +1426,9 @@ def run_batch(args):
     report["successful"].sort(key=lambda item: item["input"])
     report["failed"].sort(key=lambda item: item["input"])
     report["preserved_previous_outputs"].sort()
+    report["line_zero_placement"] = {rule: context.line_zero[rule] for rule in LINE_ZERO_RULES}
+    if context.line_zero != reported_line_zero:  # --executed-only places them as logs arrive
+        print(line_zero_message(context.line_zero), file=sys.stderr)
     report["elapsed_seconds"] = time.monotonic() - batch_started
     with atomic_text(output / report_name) as file:
         json.dump(report, file, indent=2, sort_keys=True)
@@ -1630,7 +1823,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             if not args.executed_only:
                 stats.elf_instruction_pcs = seed_pcs(counts, instruction_pcs(dump), args.load_offset)
-            sources = resolve_pcs(counts, args.elf, tool, load_offset=args.load_offset)
+            inline = {}  # type: Dict[int, InlineFrame]
+            sources = resolve_pcs(counts, args.elf, tool, load_offset=args.load_offset, inline=inline)
+            if any(needs_line(source) for source in sources.values()):
+                if dump is None:  # --executed-only did not disassemble
+                    dump = disassemble(args.elf, find_objdump(args.objdump, tool))
+                more = (lambda pcs: sources.update(resolve_pcs(
+                    pcs, args.elf, tool, load_offset=args.load_offset, inline=inline)))
+                placed = attribute_line_zero(sources, inline, Listing(dump, args.load_offset),
+                                             targets=list(counts), resolve_more=more)
+                message = line_zero_message(placed)
+                if message:
+                    print(message, file=sys.stderr)
         branch = None
         if outcomes is not None:
             outcomes.finish(counts, stats)
