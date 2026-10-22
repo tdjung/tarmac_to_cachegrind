@@ -481,6 +481,59 @@ class CoverageSummaryTests(unittest.TestCase):
             "total_merge_cachegrind.out        100.00%                -",
         ])
 
+    def test_rounding_matches_the_viewer(self):
+        # Half up, like the viewer's roundTo; Python's {:.2f} gives 3.12.
+        self.assertEqual(converter.ratio_percent(1, 32), "3.13%")
+        self.assertEqual(converter.ratio_percent(3, 8), "37.50%")
+        self.assertEqual(converter.ratio_percent(6633, 12504), "53.05%")
+        self.assertEqual(converter.percent_text(81.578), "81.58%")
+
+
+class CoverageDetailTests(unittest.TestCase):
+    def test_files_and_functions_count_lines_like_the_viewer(self):
+        # Line 42 is in two functions and ran in only one: the file counts it
+        # once (covered), each function counts it as its own line. Line 0 is
+        # a line. Code inlined from h.h lists `outer` under h.h too.
+        S = converter.Source
+        sources = {0x10: S("hot.c", "outer", 40), 0x12: S("hot.c", "outer", 42),
+                   0x20: S("hot.c", "helper", 42), 0x22: S("hot.c", "helper", 0),
+                   0x30: S("h.h", "outer", 7), 0x40: S("???", "???", 0)}
+        counts = {0x10: 1, 0x12: 3, 0x30: 0}
+        branch = converter.BranchCounts({0x12: None, 0x30: 0x10}, Counter({0x12: 2}), Counter({0x12: 1}))
+        total, files, functions = converter.coverage_detail(sources, counts, branch)
+        self.assertEqual(total.cells(), ("40.00%", "2/5", "50.00%", "2/4"))
+        self.assertEqual(files["hot.c"].cells(), ("66.67%", "2/3", "100.00%", "2/2"))
+        self.assertEqual(files["h.h"].cells(), ("0.00%", "0/1", "0.00%", "0/2"))
+        self.assertEqual(files["???"].cells(), ("0.00%", "0/1", "-", "-"))
+        self.assertEqual(functions[("outer", "hot.c")].cells(), ("100.00%", "2/2", "100.00%", "2/2"))
+        self.assertEqual(functions[("helper", "hot.c")].cells(), ("0.00%", "0/2", "-", "-"))
+        self.assertEqual(functions[("outer", "h.h")].cells(), ("0.00%", "0/1", "0.00%", "0/2"))
+        # No branch data at all: every branch cell is `-`.
+        total, _, _ = converter.coverage_detail(sources, counts, None)
+        self.assertEqual(total.cells()[2:], ("-", "-"))
+
+    def test_layout(self):
+        S = converter.Source
+        out = io.StringIO()
+        converter.write_coverage_detail(out, "x.out", {0x10: S("a.c", "f", 1), 0x12: S("a.c", "g", 2)},
+                                        {0x10: 1}, None)
+        self.assertEqual(out.getvalue().splitlines(), [
+            "Coverage detail: x.out",
+            "",
+            "Total",
+            "total  code_coverage  lines  branch_coverage  outcomes",
+            "total         50.00%    1/2                -         -",
+            "",
+            "Sources (1)",
+            "source_file  code_coverage  lines  branch_coverage  outcomes",
+            "a.c                 50.00%    1/2                -         -",
+            "",
+            "Functions (2)",
+            "function  code_coverage  lines  branch_coverage  outcomes  source_file",
+            "f               100.00%    1/1                -         -  a.c",
+            "g                 0.00%    0/1                -         -  a.c",
+        ])
+
 
 @unittest.skipUnless(OBJDUMP and ADDR2LINE, "needs Arm-capable objdump and addr2line")
 class CoverageSummaryOutputTests(unittest.TestCase):
@@ -500,6 +553,18 @@ class CoverageSummaryOutputTests(unittest.TestCase):
         lines = path.read_text().splitlines()
         self.assertEqual(lines[0].split(), ["file_name", "code_coverage", "branch_coverage"])
         return [line.split() for line in lines[1:]]
+
+    def detail_total(self, path):
+        """Code and branch % of the detail file's total row; checks sources sum to it."""
+        lines = path.read_text().splitlines()
+        total = lines[lines.index("Total") + 2].split()
+        start = lines.index(next(l for l in lines if l.startswith("Sources ("))) + 2
+        end = lines.index("", start)
+        outcomes = [l.split()[4] for l in lines[start:end] if l.split()[4] != "-"]
+        if total[4] != "-":
+            self.assertEqual(sum(int(o.split("/")[1]) for o in outcomes), int(total[4].split("/")[1]))
+            self.assertEqual(sum(int(o.split("/")[0]) for o in outcomes), int(total[4].split("/")[0]))
+        return [total[1], total[3]]
 
     def test_single_batch_and_merge_list(self):
         root = self.dir / "root"
@@ -523,10 +588,14 @@ class CoverageSummaryOutputTests(unittest.TestCase):
         self.assertEqual(total, full)                   # part adds nothing full lacks
         report = json.loads((out / "batch_report.json").read_text())
         self.assertEqual(report["coverage_summary"], "coverage_summary.txt")
+        self.assertEqual(report["coverage_detail"], "coverage_detail.txt")
+        # The detail total is the summary's total row.
+        self.assertEqual(self.detail_total(out / "coverage_detail.txt"), rows[3][1:])
 
         single = self.dir / "single.out"
         self.assertEqual(self.run_main(root / "part" / "tarmac.log", "--elf", elf, "-o", single), 0)
         self.assertEqual(self.rows(Path(str(single) + ".coverage_summary.txt")), [["single.out"] + rows[2][1:]])
+        self.assertEqual(self.detail_total(Path(str(single) + ".coverage_detail.txt")), rows[2][1:])
 
         listing = self.dir / "list.txt"
         listing.write_text("{}\n{}\n".format(out / "2_full_tarmac_cachegrind.out", out / "3_part_tarmac_cachegrind.out"))
@@ -534,6 +603,7 @@ class CoverageSummaryOutputTests(unittest.TestCase):
         self.assertEqual(self.run_main("--merge-list", listing, "-o", merged), 0)
         self.assertEqual(self.rows(Path(str(merged) + ".coverage_summary.txt")),
                          [rows[1], rows[2], ["merged.out"] + rows[3][1:]])
+        self.assertEqual(self.detail_total(Path(str(merged) + ".coverage_detail.txt")), rows[3][1:])
 
         plain = self.dir / "plain.out"
         self.assertEqual(self.run_main(root / "full" / "tarmac.log", "--elf", elf, "-o", plain, "--no-branch"), 0)

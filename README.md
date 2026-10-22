@@ -498,6 +498,57 @@ total_merge_cachegrind.out                 88.10%           81.58%
 - `--merge-only`에서도 개별 출력 파일 이름으로 행을 만듭니다(파일 자체는 쓰지 않습니다).
 - 일괄 변환에서 라인 구조는 한 번만 만들고 로그마다 실행된 PC만 확인하므로, 로그가
   많아도 추가 시간은 작습니다.
+- %는 소수 셋째 자리에서 **반올림(half up)**합니다. performance profiler와 같은 규칙입니다.
+  Python의 기본 `{:.2f}`는 정확히 절반일 때 짝수 쪽으로 보내므로(3.125 → 3.12) 쓰지 않습니다.
+
+## Coverage 상세 파일 (소스 파일별, 함수별)
+
+최종 결과물마다 전체, **소스 파일별**, **함수별** code coverage와 branch coverage를 한 파일에
+정리합니다.
+
+| 모드 | 파일 | 대상 |
+|---|---|---|
+| 일괄 변환 | 출력 폴더의 `coverage_detail[_태그].txt` | total merge 결과 |
+| 단일 로그 | `<출력 파일>.coverage_detail.txt` | 출력 파일 |
+| `--merge-list` | `<출력 파일>.coverage_detail.txt` | merge 결과 |
+
+```text
+Coverage detail: total_merge_cachegrind.out
+
+Total
+total  code_coverage  lines  branch_coverage  outcomes
+total         87.80%  72/82           81.58%     31/38
+
+Sources (4)
+source_file                code_coverage  lines  branch_coverage  outcomes
+/proj/fw/branch/branchy.c         89.80%  44/49           90.00%     18/20
+/proj/fw/branch/shapes.S          92.31%  24/26           90.00%      9/10
+/proj/fw/branch/startup.c         66.67%    4/6           50.00%       4/8
+???                                0.00%    0/1                -         -
+
+Functions (16)
+function         code_coverage  lines  branch_coverage  outcomes  source_file
+Default_Handler          0.00%    0/1                -         -  /proj/fw/branch/startup.c
+Reset_Handler           80.00%    4/5           50.00%       4/8  /proj/fw/branch/startup.c
+SysTick_Handler        100.00%    2/2                -         -  /proj/fw/branch/branchy.c
+asm_call_gt            100.00%    5/5          100.00%       2/2  /proj/fw/branch/shapes.S
+...
+```
+
+- `lines`는 `실행된 라인/컴파일된 라인`, `outcomes`는 `커버된 outcome/(조건 분기 수 × 2)`입니다.
+  분기가 없거나 branch 데이터가 없으면(`--no-branch`, `--executed-only`) `-`입니다.
+- **Total**은 coverage 요약 파일의 마지막 행, 즉 Overview의 Overall Coverage, Branch Coverage와
+  같습니다. 소스 파일들의 outcomes를 더하면 Total과 같습니다.
+- **Sources**는 사이드바 Source Files 목록, 파일 헤더, Overview의 File Coverage Breakdown과
+  같습니다. 한 라인은 파일 안에서 한 번만 셉니다.
+- **Functions**는 사이드바 Functions 목록과 같이 **(함수, 소스 파일)마다 한 행**입니다. 헤더 등
+  다른 파일의 코드가 inline되면 같은 함수가 그 파일 이름으로 한 번 더 나옵니다. 그래서
+  `source_file` 열을 함께 씁니다. 여러 함수에 inline된 라인은 함수마다 그 함수의 라인으로
+  셉니다. 이 때문에 함수별 라인 수의 합은 파일의 라인 수보다 클 수 있습니다.
+- 행은 이름순(코드 포인트 순)입니다.
+- 뷰어와 일치하는지는 performance profiler의 `renderer/test/coverage-detail.test.mjs`가
+  검증합니다. 이 테스트는 변환기가 만든 상세 파일과, 뷰어 파서가 같은 프로파일에서 계산한
+  표가 글자 단위로 같은지 확인합니다.
 
 ## 기존 결과에서 일부 테스트만 선택해 다시 merge
 
@@ -989,7 +1040,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 Python 3.6.8 및 3.12.14 인터프리터에서 아래 66개 테스트의 통과를 확인했습니다.
-branch coverage, inline 귀속, coverage 요약, line 0 배치 테스트를 더한 108개는 Python 3.13에서 확인했습니다.
+branch coverage, inline 귀속, coverage 요약, line 0 배치, coverage 상세 테스트를 더한 111개는 Python 3.13에서 확인했습니다.
 `dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,

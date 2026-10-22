@@ -3,6 +3,7 @@
 
 import argparse
 from collections import Counter, namedtuple
+from decimal import ROUND_HALF_UP, Decimal
 from contextlib import contextmanager
 import csv
 import gzip
@@ -824,7 +825,7 @@ class LineCoverageIndex:
             return None
         line_of = self.line_of
         covered = {line_of[pc] for pc, count in counts.items() if count > 0 and pc in line_of}
-        return 100.0 * len(covered) / self.lines
+        return len(covered) / self.lines * 100  # same operation order as the viewer
 
 
 def branch_percentage(branch: Optional[BranchCounts]) -> Optional[float]:
@@ -833,10 +834,112 @@ def branch_percentage(branch: Optional[BranchCounts]) -> Optional[float]:
         return None
     covered = sum(1 for pc in branch.targets if branch.jump.get(pc, 0) > 0)
     covered += sum(1 for pc in branch.targets if branch.fall.get(pc, 0) > 0)
-    return 100.0 * covered / (2 * len(branch.targets))
+    return covered / (2 * len(branch.targets)) * 100
 
 
 SUMMARY_COLUMNS = ("file_name", "code_coverage", "branch_coverage")
+
+
+def percent_text(value: float) -> str:
+    """Two decimals, rounded as the performance profiler rounds (utils.ts
+    roundTo): normalise to 15 significant digits, then round half up. Python's
+    own `{:.2f}` rounds an exact half to even (3.125 -> 3.12, viewer 3.13)."""
+    normalised = Decimal(format(value, ".15g"))
+    return "{}%".format(normalised.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def ratio_percent(covered: int, total: int) -> str:
+    return percent_text(covered / total * 100)  # the viewer's (covered / total) * 100
+
+
+class CoverageTally:
+    """Covered/total source lines and branch outcomes for one source file,
+    one function, or everything; formatted like the viewer shows them."""
+
+    __slots__ = ("lines", "covered_lines", "outcomes", "covered_outcomes")
+
+    def __init__(self):
+        self.lines, self.covered_lines = set(), set()
+        self.outcomes = self.covered_outcomes = 0
+
+    def cells(self):
+        """code %, covered/lines, branch %, covered/outcomes; `-` if none."""
+        lines, covered = len(self.lines), len(self.covered_lines)
+        if lines:
+            code = (ratio_percent(covered, lines), "{}/{}".format(covered, lines))
+        else:
+            code = ("-", "-")
+        if self.outcomes:
+            branch = (ratio_percent(self.covered_outcomes, self.outcomes),
+                      "{}/{}".format(self.covered_outcomes, self.outcomes))
+        else:
+            branch = ("-", "-")
+        return code + branch
+
+
+def coverage_detail(sources: Dict[int, Source], counts, branch: Optional[BranchCounts]):
+    """Total, per source file and per function coverage of one profile.
+
+    `sources` must be exactly the profile's rows (PC -> location). The rules
+    are the performance profiler's, so every number matches its screens:
+    - code: a (file, line) is covered if any PC on it has Ir > 0. A file
+      counts each line once even when several functions share it (inlined
+      code); a function counts the lines of its own rows. Line 0 is a line.
+    - branch: each conditional branch site has two outcomes (taken, not
+      taken); a site belongs to the file and function of its row.
+    - functions are listed per (file, function), as the viewer's Functions
+      tab does, so code inlined from a header appears under that file too.
+    Returns (total, {file: tally}, {(function, file): tally}).
+    """
+    total, files, functions = CoverageTally(), {}, {}
+    for pc, source in sources.items():
+        line = (source.file, source.line)
+        ran = counts.get(pc, 0) > 0
+        for tally, key in ((total, line), (files.setdefault(source.file, CoverageTally()), source.line),
+                           (functions.setdefault((source.function, source.file), CoverageTally()),
+                            source.line)):
+            tally.lines.add(key)
+            if ran:
+                tally.covered_lines.add(key)
+    if branch and branch.targets:
+        for pc in branch.targets:
+            source = sources.get(pc, Source())
+            covered = (branch.jump.get(pc, 0) > 0) + (branch.fall.get(pc, 0) > 0)
+            for tally in (total, files.setdefault(source.file, CoverageTally()),
+                          functions.setdefault((source.function, source.file), CoverageTally())):
+                tally.outcomes += 2
+                tally.covered_outcomes += covered
+    return total, files, functions
+
+
+DETAIL_COLUMNS = ("code_coverage", "lines", "branch_coverage", "outcomes")
+
+
+def write_coverage_detail(out: TextIO, name: str, sources: Dict[int, Source], counts,
+                          branch: Optional[BranchCounts]) -> None:
+    """Total, then every source file, then every function (with its file):
+    code coverage % and covered/total lines, branch coverage % and
+    covered/total outcomes; `-` when not measurable."""
+    total, files, functions = coverage_detail(sources, counts, branch)
+
+    def table(heading, rows, extra=None):
+        body = [[row[0]] + list(row[1].cells()) + ([row[2]] if extra else []) for row in rows]
+        head = [heading] + list(DETAIL_COLUMNS) + ([extra] if extra else [])
+        widths = [max(len(r[i]) for r in [head] + body) for i in range(len(head))]
+        for r in [head] + body:
+            cells = [r[0].ljust(widths[0])] + [c.rjust(w) for c, w in zip(r[1:5], widths[1:5])]
+            if extra:
+                cells.append(r[5])
+            out.write("  ".join(cells).rstrip() + "\n")
+
+    out.write("Coverage detail: {}\n\n".format(one_line(name)))
+    out.write("Total\n")
+    table("total", [("total", total)])
+    out.write("\nSources ({})\n".format(len(files)))
+    table("source_file", [(one_line(f), files[f]) for f in sorted(files)])
+    out.write("\nFunctions ({})\n".format(len(functions)))
+    table("function", [(one_line(fn), functions[(fn, f)], one_line(f))
+                       for fn, f in sorted(functions)], extra="source_file")
 
 
 def write_coverage_summary(out: TextIO, rows) -> None:
@@ -851,7 +954,7 @@ def write_coverage_summary(out: TextIO, rows) -> None:
             return "-"
         if isinstance(value, str):
             return value
-        return "{:.2f}%".format(value)
+        return percent_text(value)
 
     names = [one_line(row[0]) for row in rows]
     width = max([len(SUMMARY_COLUMNS[0])] + [len(name) for name in names])
@@ -1324,6 +1427,7 @@ def run_batch(args):
         tag = "_" + tag
     merge_name = "total_merge" + tag + "_cachegrind.out"
     summary_name = "coverage_summary" + tag + ".txt"
+    detail_name = "coverage_detail" + tag + ".txt"
     report_name = "batch_report" + tag + ".json"
     index_name = "coverage_index" + tag + ".json"
     manifest = [{"index": indices[path], "input": str(path.relative_to(root)),
@@ -1339,14 +1443,16 @@ def run_batch(args):
     base_index = LineCoverageIndex({position.pc: Source(*position[1:]) for position in context.baseline})
     summary_rows = {}  # test index -> (name, code %, branch %)
 
-    def line_index(counts):
+    def row_sources(counts):
         # Rows of this profile: the ELF baseline plus any PCs outside it.
-        extras = [pc for pc in counts if pc not in context.baseline_pcs]
-        if not extras:
-            return base_index
         sources = {position.pc: Source(*position[1:]) for position in context.baseline}
-        sources.update({pc: context.sources[pc] for pc in extras})
-        return LineCoverageIndex(sources)
+        sources.update({pc: context.sources[pc] for pc in counts if pc not in context.baseline_pcs})
+        return sources
+
+    def line_index(counts):
+        if all(pc in context.baseline_pcs for pc in counts):
+            return base_index
+        return LineCoverageIndex(row_sources(counts))
 
     for index, result in enumerate(batch_results(tasks, context, args, workers), 1):
         path, name, counts, stats, timings, error, outcomes = result
@@ -1418,6 +1524,10 @@ def run_batch(args):
             write_coverage_summary(file, rows)
         report["coverage_summary"] = summary_name
         progress("complete " + json.dumps(summary_name), args)
+        with atomic_text(output / detail_name) as file:
+            write_coverage_detail(file, merge_name, row_sources(total), total, branch_total)
+        report["coverage_detail"] = detail_name
+        progress("complete " + json.dumps(detail_name), args)
     if not report["successful"] and (output / merge_name).exists():
         report["preserved_previous_outputs"].append(merge_name)
         print("warning: all logs failed; previous merge was not updated: " + merge_name, file=sys.stderr, flush=True)
@@ -1701,15 +1811,19 @@ def run_profile_merge(args):
     summary_rows.append((output.name, LineCoverageIndex(sources).percentage(total), branch_percentage(branch)))
     with atomic_text(summary_path) as file:
         write_coverage_summary(file, summary_rows)
+    detail_path = output.with_name(output.name + ".coverage_detail.txt")
+    with atomic_text(detail_path) as file:
+        write_coverage_detail(file, output.name, sources, total, branch)
     report = {"mode": "merge_list", "selection_list": str(listing), "merged": len(entries),
               "total_instructions": sum(total.values()), "merged_output": str(output),
               "coverage_index": str(index_path), "coverage_summary": str(summary_path),
+              "coverage_detail": str(detail_path),
               "indices_preserved": not args.reindex,
               "inputs": manifest, "elapsed_seconds": time.monotonic() - started}
     with atomic_text(report_path) as file:
         json.dump(report, file, indent=2, sort_keys=True)
         file.write("\n")
-    for path in (output, index_path, report_path, summary_path):
+    for path in (output, index_path, report_path, summary_path, detail_path):
         progress("complete " + json.dumps(str(path), ensure_ascii=False), args)
     return 0
 
@@ -1856,11 +1970,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         with atomic_text(args.output) as out:
             write_cachegrind(out, costs, args.elf, branch)
         summary_path = args.output.with_name(args.output.name + ".coverage_summary.txt")
+        detail_path = args.output.with_name(args.output.name + ".coverage_detail.txt")
+        rows = {pc: sources[pc] for pc in counts}  # sources may hold extra neighbours
         with atomic_text(summary_path) as out:
-            write_coverage_summary(out, [(args.output.name, LineCoverageIndex(sources).percentage(counts),
+            write_coverage_summary(out, [(args.output.name, LineCoverageIndex(rows).percentage(counts),
                                           branch_percentage(branch))])
+        with atomic_text(detail_path) as out:
+            write_coverage_detail(out, args.output.name, rows, counts, branch)
         print("complete " + json.dumps(str(args.output), ensure_ascii=False), file=sys.stderr, flush=True)
         print("complete " + json.dumps(str(summary_path), ensure_ascii=False), file=sys.stderr, flush=True)
+        print("complete " + json.dumps(str(detail_path), ensure_ascii=False), file=sys.stderr, flush=True)
         print(f"{stats.instructions:,} instructions, {stats.unique_pcs:,} unique PCs -> {args.output}", file=sys.stderr)
         if not stats.instructions:
             print("warning: no executed instructions found; output contains only zero-cost ELF locations", file=sys.stderr)
