@@ -4,3 +4,4 @@ __pycache__/
 cachegrind.out*
 *.elf
 *.o
+!tests/firmware/*.elf
