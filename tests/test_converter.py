@@ -206,12 +206,24 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o666)
 
     def test_addr2line_discriminator_unknowns_and_unique_batches(self):
-        result = subprocess.CompletedProcess([], 0, "foo()\nC:/src/main.cpp:12 (discriminator 2)\n??\n??:?\n", "")
+        result = subprocess.CompletedProcess(
+            [], 0, "0x00001000\nfoo()\nC:/src/main.cpp:12 (discriminator 2)\n0x00001002\n??\n??:?\n", "")
         with patch.object(converter.subprocess, "run", return_value=result) as run:
             sources = converter.resolve_pcs([0x3000, 0x3002, 0x3000], Path("a.elf"), "addr2line", load_offset=0x2000)
         self.assertEqual(run.call_args[1]["input"], "0x1000\n0x1002\n")
         self.assertEqual(sources[0x3000], converter.Source("C:/src/main.cpp", "foo()", 12))
         self.assertEqual(sources[0x3002], converter.Source())
+
+    def test_inlined_code_keeps_inline_line_but_containing_function(self):
+        # func_B inlined into func_A: line from the inline body, function from
+        # the outermost frame. LLVM prints unpadded addresses.
+        result = subprocess.CompletedProcess(
+            [], 0, "0x1000\nfunc_B\na.c:6\nmid\na.c:30\nfunc_A\na.c:12\n0x1002\nfunc_A\na.c:13\n", "")
+        with patch.object(converter.subprocess, "run", return_value=result) as run:
+            sources = converter.resolve_pcs([0x1000, 0x1002], Path("a.elf"), "addr2line")
+        self.assertIn("-i", run.call_args[0][0])
+        self.assertEqual(sources[0x1000], converter.Source("a.c", "func_A", 6))
+        self.assertEqual(sources[0x1002], converter.Source("a.c", "func_A", 13))
 
     def test_bad_symbolizer_output_and_negative_offset_fail(self):
         result = subprocess.CompletedProcess([], 0, "foo\n", "")

@@ -170,7 +170,9 @@ python3 tarmac_to_cachegrind.py /work/test_results \
 `--max-depth 2`를 지정하세요. 파일명 조건에 맞지 않는 파일은 파일 정보 조회를
 최소화하고, 모든 경로에 `resolve()`를 호출하지 않습니다.
 
-끝에는 **`total_merge_cachegrind.out`**, **`coverage_index.json`**, **`batch_report.json`**도 생성됩니다.
+끝에는 **`total_merge_cachegrind.out`**, **`coverage_index.json`**, **`coverage_summary.txt`**,
+**`batch_report.json`**도 생성됩니다. `coverage_summary.txt`의 형식은
+[Coverage 요약 파일](#coverage-요약-파일)을 참고하세요.
 merge는 변환 중 메모리에서 동일한 runtime PC의 `Ir`을 합산한 뒤 공유 ELF의
 파일·함수·라인에 연결합니다. 개별 출력
 파일 800개를 다시 읽는 post-merge 단계가 없습니다. 미실행 라인의 0은 유지되며,
@@ -211,11 +213,11 @@ python3 tarmac_to_cachegrind.py /work/test_results \
 두 실행에 **같은 출력 폴더**를 지정할 수 있습니다. `--log-name`을 지정한 경우
 `.log` 또는 `.log.gz`를 제거한 이름으로 merge/보고서를 구분합니다.
 
-| 선택 옵션 | 합산 파일 | 보고서 |
-|---|---|---|
-| `--log-name tarmac_core0.log` | `total_merge_tarmac_core0_cachegrind.out` | `batch_report_tarmac_core0.json` |
-| `--log-name tarmac_core1.log` | `total_merge_tarmac_core1_cachegrind.out` | `batch_report_tarmac_core1.json` |
-| 미지정 (`--pattern`만 사용한 경우 포함) | `total_merge_cachegrind.out` | `batch_report.json` |
+| 선택 옵션 | 합산 파일 | 보고서 | coverage 요약 |
+|---|---|---|---|
+| `--log-name tarmac_core0.log` | `total_merge_tarmac_core0_cachegrind.out` | `batch_report_tarmac_core0.json` | `coverage_summary_tarmac_core0.txt` |
+| `--log-name tarmac_core1.log` | `total_merge_tarmac_core1_cachegrind.out` | `batch_report_tarmac_core1.json` | `coverage_summary_tarmac_core1.txt` |
+| 미지정 (`--pattern`만 사용한 경우 포함) | `total_merge_cachegrind.out` | `batch_report.json` | `coverage_summary.txt` |
 
 같은 코어를 다시 실행하면 이번에 생성하는 개별 파일·합산·목록·보고서를 교체합니다. 기존 결과에
 중복 누적하지 않습니다. `--log-name`으로 `.log`와 그 압축본 `.log.gz`를 각각 실행하면
@@ -470,6 +472,88 @@ Completed: 800 succeeded, 0 failed; ...
 `--output-dir`도 사용할 수 있습니다. `--pc-counts`, `--stats`, `--skip-malformed`는
 단일 로그 전용이며 배치는 `batch_report.json`에 파일별 통계를 기록합니다.
 
+## Coverage 요약 파일
+
+변환할 때마다 프로파일별 code coverage와 branch coverage를 한 파일에 정리합니다.
+
+```text
+file_name                           code_coverage  branch_coverage
+1_broken_tarmac_cachegrind.out             FAILED           FAILED
+2_full_es_tarmac_cachegrind.out            88.10%           81.58%
+5_part_1500_tarmac_cachegrind.out          40.48%           36.84%
+total_merge_cachegrind.out                 88.10%           81.58%
+```
+
+| 모드 | 파일 | 행 |
+|---|---|---|
+| 일괄 변환 | 출력 폴더의 `coverage_summary[_태그].txt` | 개별 출력 파일마다 한 행(번호 순), 맨 아래 total merge |
+| 단일 로그 | `<출력 파일>.coverage_summary.txt` | 출력 파일 한 행 |
+| `--merge-list` | `<출력 파일>.coverage_summary.txt` | 입력 파일마다 한 행, 맨 아래 merge 결과 |
+
+- **숫자는 performance profiler 화면과 같습니다.** code coverage는 Overview의 Overall
+  Coverage와, branch coverage는 Branch Coverage와 같은 방식으로 계산합니다.
+- **code coverage:** 실행된 라인 / 컴파일된 라인입니다. 라인은 (파일, 라인)마다 한 번 세고,
+  그 라인의 PC 중 하나라도 실행(`Ir > 0`)됐으면 커버입니다. inline 코드처럼 여러 함수에 걸친
+  라인도 한 라인이며, 어느 함수에서든 실행됐으면 커버입니다. branch 이벤트는 실행 여부에 쓰지
+  않고, `???`도 포함합니다. 함수별·파일별 %도 같은 방식으로 각각 계산합니다.
+- **branch coverage:** 커버된 outcome / (조건 분기 수 × 2)입니다.
+- **`-`와 `FAILED`:** `--no-branch`, `--executed-only`, 분기가 없는 ELF처럼 계산할 수 없으면
+  `-`로 표시합니다. 변환에 실패한 로그는 `FAILED`로 표시하고 total에서 빠집니다.
+- `--merge-only`에서도 개별 출력 파일 이름으로 행을 만듭니다(파일 자체는 쓰지 않습니다).
+- 일괄 변환에서 라인 구조는 한 번만 만들고 로그마다 실행된 PC만 확인하므로, 로그가
+  많아도 추가 시간은 작습니다.
+- %는 소수 셋째 자리에서 **반올림(half up)**합니다. performance profiler와 같은 규칙입니다.
+  Python의 기본 `{:.2f}`는 정확히 절반일 때 짝수 쪽으로 보내므로(3.125 → 3.12) 쓰지 않습니다.
+
+## Coverage 상세 파일 (소스 파일별, 함수별)
+
+최종 결과물마다 전체, **소스 파일별**, **함수별** code coverage와 branch coverage를 한 파일에
+정리합니다.
+
+| 모드 | 파일 | 대상 |
+|---|---|---|
+| 일괄 변환 | 출력 폴더의 `coverage_detail[_태그].txt` | total merge 결과 |
+| 단일 로그 | `<출력 파일>.coverage_detail.txt` | 출력 파일 |
+| `--merge-list` | `<출력 파일>.coverage_detail.txt` | merge 결과 |
+
+```text
+Coverage detail: total_merge_cachegrind.out
+
+Total
+total  code_coverage  lines  branch_coverage  outcomes
+total         87.80%  72/82           81.58%     31/38
+
+Sources (4)
+source_file                code_coverage  lines  branch_coverage  outcomes
+/proj/fw/branch/branchy.c         89.80%  44/49           90.00%     18/20
+/proj/fw/branch/shapes.S          92.31%  24/26           90.00%      9/10
+/proj/fw/branch/startup.c         66.67%    4/6           50.00%       4/8
+???                                0.00%    0/1                -         -
+
+Functions (16)
+function         code_coverage  lines  branch_coverage  outcomes  source_file
+Default_Handler          0.00%    0/1                -         -  /proj/fw/branch/startup.c
+Reset_Handler           80.00%    4/5           50.00%       4/8  /proj/fw/branch/startup.c
+SysTick_Handler        100.00%    2/2                -         -  /proj/fw/branch/branchy.c
+asm_call_gt            100.00%    5/5          100.00%       2/2  /proj/fw/branch/shapes.S
+...
+```
+
+- `lines`는 `실행된 라인/컴파일된 라인`, `outcomes`는 `커버된 outcome/(조건 분기 수 × 2)`입니다.
+  분기가 없거나 branch 데이터가 없으면(`--no-branch`, `--executed-only`) `-`입니다.
+- **Total**은 coverage 요약 파일의 마지막 행, 즉 Overview의 Overall Coverage, Branch Coverage와
+  같습니다. 소스 파일들의 outcomes를 더하면 Total과 같습니다.
+- **Sources**는 사이드바 Source Files 목록, 파일 헤더, Overview의 File Coverage Breakdown과
+  같습니다. 한 라인은 파일 안에서 한 번만 셉니다.
+- **Functions**는 사이드바 Functions 목록과 같이 **(함수, 소스 파일)마다 한 행**입니다. 헤더 등
+  다른 파일의 코드가 inline되면 같은 함수가 그 파일 이름으로 한 번 더 나옵니다. 그래서
+  `source_file` 열을 함께 씁니다. 여러 함수에 inline된 라인은 함수마다 그 함수의 라인으로
+  셉니다. 이 때문에 함수별 라인 수의 합은 파일의 라인 수보다 클 수 있습니다.
+- 행은 이름순(코드 포인트 순)입니다.
+- 뷰어와 일치하는지는 performance profiler의 `renderer/test/coverage-detail.test.mjs`가
+  검증합니다. 이 테스트는 변환기가 만든 상세 파일과, 뷰어 파서가 같은 프로파일에서 계산한
+  표가 글자 단위로 같은지 확인합니다.
+
 ## 기존 결과에서 일부 테스트만 선택해 다시 merge
 
 `--merge-list`는 **이미 생성한 개별 Cachegrind 파일**을 읽어 새 total과 테스트 인덱스를
@@ -612,8 +696,8 @@ timestamp는 정수이며 생략할 수 있습니다. 단위는 `tic`, `ps`, `ns
 |---|---|
 | 정상 `ES`, `IT` | 해당 PC의 `Ir`에 1 추가 |
 | `IF` | 같은 cycle에 folded된 명령어도 1 추가 |
-| `IS` | 조건 불충족이므로 제외 |
-| `ES ... CCFAIL ...` | 조건 불충족이므로 제외 |
+| `IS` | 조건 불충족이므로 `Ir`에서 제외. 단, 조건 분기는 "분기하지 않음"으로 실행된 것이므로 `Ir`에 포함하고 not taken으로 집계 |
+| `ES ... CCFAIL ...` | 위와 같음 |
 | `ES EXC ...` | 예외 이벤트로 집계하고 `Ir`에서 제외 |
 | 인코딩이 `--------`, `....` 등인 레코드 | fetch 실패/알 수 없는 인코딩으로 제외 |
 | `R`, `BR`, `E`, `BNR...`, `MNR...`, `LD`, `ST` 등 | 실행 명령어가 아니므로 제외 |
@@ -667,8 +751,8 @@ ELF 조회에는 `PC - load_offset`을 사용합니다. 함수의 비용은
 
 **coverage의 범위는 ELF에 남아 있고 소스 라인으로 매핑 가능한 명령어입니다.**
 최적화/링커에 의해 제거된 코드, 주석, 빈 줄은 0인 실행 가능 라인으로 추가하지 않습니다.
-PC별 실행 여부를 확인할 수 있지만, 이 값만으로 완전한 branch/condition coverage를
-나타내지는 않습니다.
+PC별 실행 여부만으로는 조건 분기의 양쪽이 모두 실행됐는지 알 수 없습니다. 분기별
+taken/not taken 여부는 아래 [Branch coverage](#branch-coverage)의 `Bc Bcm Bs` 이벤트로 기록합니다.
 
 CSV에도 미실행 PC를 `Ir=0`으로 포함합니다. JSON의 `unique_pcs`는 trace에서 실제로
 실행된 고유 PC 수이고, `elf_instruction_pcs`는 objdump에서 수집한 고유 명령어 주소
@@ -693,9 +777,70 @@ python3 tarmac_to_cachegrind.py core0.log --elf core0.elf \
 심볼이나 소스 라인을 찾지 못한 실행 수는 stderr 및 선택적 JSON에 보고합니다.
 PC가 ELF 범위를 벗어나도 해당 비용을 버리지 않습니다.
 
-Inlining은 `addr2line -f -C`의 단일 결과에 한 번만 귀속합니다(`-i` 미사용).
-인라인 호출 계층을 만들지 않습니다. 최적화로 인한 라인 매핑의 모호함, 심볼 alias,
+Inlining된 코드는 그 코드가 실제로 들어 있는 함수에 귀속합니다. `addr2line -a -f -i -C`가
+돌려주는 inline 호출 계층 중 **소스 파일과 라인은 가장 안쪽(inline된 함수의 본문)**에서,
+**함수 이름은 가장 바깥쪽(그 명령어가 있는 함수)**에서 가져옵니다. 예를 들어 `func_A` 안에
+`func_B`가 조건부로 inline되어 objdump에 다음처럼 보이면,
+
+```text
+    123a:  bcs.n  ...
+func_B():
+    123c:  ...
+func_A():
+    123e:  ldrh.w ...
+```
+
+`0x123c`는 `fn=func_A`에 속하고 라인은 `func_B` 본문의 라인으로 기록됩니다. 그래서 func_A의
+명령어가 중간에 끊기지 않고, func_B 본문 라인의 실행 여부도 그대로 표시됩니다. objdump
+fallback(addr2line 없음)도 ELF 심볼 기준이라 같은 결과입니다. 한 PC는 한 번만 귀속하며
+inline 계층마다 비용을 늘리지 않습니다. inline 본문이 다른 파일(헤더 등)에 있으면 그 파일의
+`fl=` 아래에 같은 함수 이름으로 기록됩니다. 최적화로 인한 라인 매핑의 모호함, 심볼 alias,
 별도 이미지/overlay, self-modifying code를 복원하지 않습니다.
+
+### 소스 라인이 없는 명령어 (line 0)
+
+최적화된 코드에는 디버그 정보(DWARF)가 **line 0**, 즉 "어느 소스 라인에도 속하지 않음"으로
+기록한 명령어가 있습니다. 여러 라인이 함께 쓰는 코드, 라인 경계를 넘어 옮겨진 코드,
+inline 본문의 경계 등이 해당하며 clang에서 특히 많습니다. `addr2line`은 이런 주소를
+`file.c:?`나 `??:0`으로 보고하고, `objdump -l`은 위치를 출력하지 않아 **바로 위 라인에
+이어지는 것처럼** 보입니다.
+
+```text
+B():
+file.c:938
+    10:  ...
+    12:  ...
+    14:  ...
+A():                ← 위치 표시 없음: line 0
+    16:  ...           (addr2line: B / file.c:?, A / file.c:1039)
+    18:  ...
+    1a:  ...
+```
+
+그대로 두면 이 명령어들은 라인 0으로 기록되어 938 라인의 Ir, coverage, 분기 표시에서
+빠집니다. 변환기는 다음 순서로 라인을 정합니다.
+
+| 순서 | 조건 | 받는 라인 | 예 |
+|---|---|---|---|
+| previous | 바로 앞 명령어가 이 명령어로 이어서 실행되고, 같은 (inline) 함수 | 앞 명령어의 라인 | 16~1a → 938 |
+| next | 앞이 무조건 `b`, `bx`, `pop {..pc}`, `ldr/mov pc`, `tbb/tbh`라 다른 곳에서 점프해 들어오는 코드 | 이어지는 같은 (inline) 함수 명령어 중 첫 라인 | 점프 대상의 준비 코드 |
+| call_site | inline 함수 안에서 앞뒤로 라인을 찾지 못함 | 그 함수를 호출한 라인 (addr2line 다음 frame) | → 1039 |
+| unresolved | 위 모두 해당 없음 (정렬 padding 등) | 0 유지 | |
+
+- 조건 분기나 IT 블록 안의 조건부 `bx` 뒤는 이어서 실행될 수 있으므로 previous를 적용합니다.
+- **다른 inline 함수의 라인은 이어받지 않습니다.** inline된 B의 코드가 A의 라인을 받거나,
+  그 반대가 되지 않습니다. 함수(`fn=`)는 바뀌지 않고 라인과 파일만 정합니다.
+- `??:0`처럼 파일도 모르면 파일도 함께 받습니다.
+- `--executed-only`에서도 결과가 같습니다. 필요한 이웃 명령어는 실행 여부와 관계없이
+  addr2line으로 풀어서 사용하므로, trace에 따라 라인이 달라지지 않습니다.
+- 처리 결과는 stderr에 `info: N instructions have no source line (line 0) ...; placed by
+  previous a, next b, call site c, unresolved d`로 출력하고, 배치에서는
+  `batch_report.json`의 `line_zero_placement`에도 기록합니다. unresolved만 기존처럼
+  "instructions without source lines" 경고에 포함됩니다.
+
+line 0은 원래 정답이 없는 정보이므로 이 규칙은 objdump 화면과 실행 순서에 맞춘
+추정입니다. objdump fallback(addr2line 없음)은 objdump가 위치를 출력하지 않는 명령어에
+위 라인을 그대로 적용하므로, previous 규칙만 흐름과 inline 구분 없이 적용한 것과 같습니다.
 
 ### addr2line이 없는 환경
 
@@ -717,6 +862,143 @@ fallback에서는 디스어셈블의 함수 심볼과 파일/라인 표기를 �
 명시적으로 지정한 `--addr2line` 경로가 없거나, 발견한 addr2line이 실행 중 실패하면
 오류로 처리합니다. 자동 전환은 **옵션을 생략했고 자동 탐색에서도 찾지 못했을 때만**
 발생합니다. objdump까지 없거나 실행에 실패하면 변환을 중단합니다.
+
+## Branch coverage
+
+기본 모드(ELF 전체를 objdump로 분석하는 모드)에서는 분기 명령어마다 실행 결과를 함께
+기록합니다. 대상은 Cortex-M4(ARMv7E-M)와 Cortex-M35P(ARMv8-M Mainline)의 Thumb/Thumb-2
+명령어이며 추가 옵션은 필요 없습니다. 이벤트 이름은 기존 도구의 `Bc Bcm` 체계를 따르고,
+실행되지 않은 분기를 표시하기 위해 `Bs`를 더합니다. 조건 분기만 기록하며 무조건 분기
+(`Bi`/`Bim`)는 기록하지 않습니다.
+
+```text
+events: Ir Bc Bcm Bs
+fl=src/uart.c
+fn=uart_rx
+jcnd=3/15 0x80ca 25
+0x80b2 23
+0x80b2 23 4 15 12 1
+0x80c4 25 14
+```
+
+| 이벤트 | 의미 |
+|---|---|
+| `Bc` | 조건 분기가 실행된 횟수. 결과(jump/fall)를 판정한 실행만 셉니다 |
+| `Bcm` | 그중 분기하지 않은(not taken) 횟수. 다음 명령어로 넘어간 경우이며 조건 실패(`CCFAIL`, `IS`)를 포함합니다 |
+| `Bs` | 조건 분기 위치이면 1. 한 번도 실행되지 않은 분기도 1이며 coverage의 분모입니다. performance profiler는 이 이벤트를 화면에 표시하지 않고 branch coverage 계산에만 씁니다 |
+
+분기한(taken) 횟수는 `Bc − Bcm`입니다. 조건 분기의 양쪽이 모두 커버되려면
+`Bc − Bcm > 0`이고 `Bcm > 0`이어야 합니다. `Bc > 0`은 그 분기가 실행됐다는 뜻일 뿐
+양쪽을 다 갔다는 뜻이 아닙니다. 모든 값은 합산 가능하므로 뷰어나 `--merge-list`에서
+여러 프로파일을 합쳐도 판정이 유지됩니다.
+
+조건 분기 행은 `Ir Bc Bcm 1`, 그 밖의 행은 `Ir`만 기록합니다(callgrind 형식에서 생략된
+비용은 0입니다). 대상이 고정된 조건 분기 앞에는
+callgrind 표준 `jcnd=<taken>/<Bc> <대상 PC> <대상 라인>` 레코드와 위치만 있는 줄을 둡니다.
+뷰어는 이 정보로 실행되지 않은 쪽의 도착 위치를 화살표로 그립니다.
+
+ELF에 조건 분기가 하나도 없으면 기존과 같은 `events: Ir` 형식을 출력합니다.
+`--no-branch`를 지정해도 기존 형식이 됩니다. 이때도 분기 분석은 하므로 `Ir` 값은 branch
+이벤트를 쓸 때와 같습니다. `--executed-only`에서는 실행되지 않은 분기를
+분모에 넣을 수 없으므로 branch 이벤트를 기록하지 않습니다.
+
+### `Ir`과 `Bc`의 관계
+
+조건 분기에서 `Ir`은 그 분기가 실행된 횟수 전체이고, `Bc`는 그중 결과를 판정한 횟수입니다.
+그래서 항상 `Ir ≥ Bc`입니다.
+
+- **조건 실패:** `beq`가 조건 불충족으로 분기하지 않으면 trace에 `CCFAIL` 또는 `IS`로
+  찍힙니다. 분기 명령어는 실제로 실행됐으므로 `Ir`, `Bc`, `Bcm`에 모두 셉니다. 예: 10번 실행
+  중 4번 분기, 6번 조건 실패면 `Ir=10`, `Bc=10`, `Bcm=6`입니다. `CCFAIL`을 표시하지 않는
+  ES 생성기의 trace에서도 같은 값이 나옵니다. 분기가 아닌 조건부 명령어(`movge` 등)의 조건
+  실패는 지금처럼 `Ir`에서 제외합니다.
+- **판정 불가:** 분기 직후에 인터럽트가 들어오면 다음 레코드가 인터럽트 핸들러라서 원래
+  어디로 가려 했는지 알 수 없습니다. 이 실행은 `Ir`에는 세지만 `Bc`에는 넣지 않고
+  `branch_unresolved`로 따로 셉니다. `Bc`에 넣으면 `Bc − Bcm`으로 계산되는 taken에 섞여서,
+  실제로는 한 번도 분기하지 않았는데 분기한 것으로 보일 수 있기 때문입니다. `Ir − Bc`가 이
+  판정 불가 횟수입니다.
+
+### 명령어 분류
+
+| 명령어 | 분류 | 비고 |
+|---|---|---|
+| `b<cc>` (`.n`/`.w`) | `Bc`/`Bcm` | 대상 고정, `jcnd=` 있음 |
+| `cbz`, `cbnz` | `Bc`/`Bcm` | 대상 고정, `jcnd=` 있음 |
+| IT 블록 안의 `bl<cc>` | `Bc`/`Bcm` | 조건부 호출. taken = 호출함 |
+| IT 블록 안의 `bx<cc>`, `bxns<cc>`, `pop<cc> {..., pc}`, `ldm<cc> {..., pc}`, `ldr<cc> pc, ...`, `mov<cc> pc, ...` | `Bc`/`Bcm` | 조건부 return·점프. 대상이 실행 시점에 정해지므로 `jcnd=` 없음 |
+| IT 블록 안의 `blx<cc>`, `blxns<cc>` | `Bc`/`Bcm` | 조건부 간접 호출, `jcnd=` 없음 |
+| `b`, `bl`, `blx`, `bx`, `bxns`, `blxns`, `tbb`, `tbh`, `pop {..., pc}`, `ldr pc, ...` 등 | 기록 안 함 | 무조건 분기·호출·return·table branch. 갈 곳이 하나뿐이라 coverage 대상이 아니며, 실행 횟수는 그 PC의 `Ir`과 같습니다 |
+| IT 블록 안의 분기 아닌 조건부 명령어(`movge`, `ldrls` 등) | 없음 | 아래 [분기 없는 조건부 명령어](#분기-없는-조건부-명령어) 참고 |
+
+`tbb`/`tbh`(switch 문의 jump table)는 무조건 분기로 봅니다. 어떤 case로 갔는지는
+case별 코드의 실행 여부(code coverage)로 확인합니다.
+
+분기 위치와 대상, fallthrough 주소는 objdump 출력에서 얻습니다. GNU
+`arm-none-eabi-objdump`와 `llvm-objdump`의 출력 형식을 모두 지원하며 두 도구의 결과가
+같음을 테스트로 확인합니다.
+
+### 결과 판정
+
+trace를 읽으면서 조건 분기 바로 다음에 PC가 있는 명령어 레코드를 보고 판정합니다.
+
+| 다음 레코드 | 판정 |
+|---|---|
+| 분기 위치 자체의 `CCFAIL`/`IS` | not taken (`Bc`, `Bcm` 증가) |
+| 대상 PC | taken (`Bc` 증가) |
+| fallthrough PC | not taken (`Bc`, `Bcm` 증가) |
+| 같은 PC의 반복 레코드(예: `IT` 뒤 `IF`) | 무시하고 다음 레코드로 판정 |
+| 대상이 없는 분기에서 fallthrough가 아닌 PC | taken. 단, return 계열 분기 뒤 함수 시작 주소는 예외 진입으로 보고 판정 불가 |
+| `ES EXC`, 그 밖의 PC, trace 끝 | 판정 불가. `Bc`에 넣지 않고 `branch_unresolved`로 셈 |
+
+다음 PC로 판정하므로 `CCFAIL`을 표시하지 않는 ES 생성기에서도 결과가 같습니다.
+**판정하지 못한 실행은 커버로 세지 않습니다.** 분기 직후에 인터럽트가 들어오면 그 실행은
+빠지므로 실제로는 실행된 쪽이 미커버로 보일 수는 있지만, 실행되지 않은 쪽이 커버로 보이지는
+않습니다.
+
+IT 형식 trace에는 예외 진입 레코드가 없습니다. 그래서 조건부 간접 호출(`blx<cc>`) 직후의
+인터럽트는 taken으로 셀 수 있습니다. 이 조합은 드물어 별도로 처리하지 않습니다.
+
+### 분기 없는 조건부 명령어
+
+컴파일러는 조건문을 분기 없이 IT 블록(`it ge; movge r0, r2`)으로 만들기도 합니다.
+`-O2`로 빌드한 테스트 펌웨어에서는 조건부 명령어 29개 중 10개가 분기가 아닌 IT 블록
+명령어였습니다. 이 명령어는
+branch coverage에 포함하지 않으며 `Ir`/code coverage로 확인합니다. 조건이 실패한 실행은
+`Ir`에서 빠지므로, 조건이 한 번도 참이 아니었다면 그 라인은 미실행으로 보입니다.
+개수는 stats의 `conditional_nonbranch_instructions`와, 한쪽 결과만 나온 수
+`conditional_nonbranch_one_sided`로 확인할 수 있습니다.
+
+### Stats 항목
+
+| 항목 | 의미 |
+|---|---|
+| `branch_sites` | ELF의 조건 분기 위치 수 |
+| `branch_sites_executed` | 한 번 이상 판정된 분기 위치 수 |
+| `branch_outcomes_covered` | 커버된 결과 수(최대 `2 × branch_sites`). taken과 not taken을 각각 하나로 셉니다 |
+| `branch_unresolved` | 판정하지 못한 분기 실행 수 |
+| `conditional_nonbranch_instructions` | IT 블록 안의 분기 아닌 조건부 명령어 수 |
+| `conditional_nonbranch_one_sided` | 그중 실행·조건 실패 중 한쪽만 나온 수 |
+
+### 처리 비용
+
+분기 판정을 위해 trace 해석 시간이 약 15% 늘어납니다(549,000줄 기준). `--no-branch`에서는
+기존과 같습니다. ELF 분석은 기존 objdump 실행 결과를 그대로 사용하므로 추가 실행이 없습니다.
+
+### 실제 실행 기반 검증
+
+`tests/firmware`에는 두 코어용으로 빌드한 테스트 펌웨어와, QEMU로 실행해 만든 trace가
+있습니다. QEMU에는 Cortex-M35P 모델이 없어 같은 명령어 집합(ARMv8-M Mainline)인
+Cortex-M33(`mps2-an505`)에서 실행합니다. `qemu_to_tarmac.py`는 실행 기록을 ES(CCFAIL
+포함/미포함)와 IT(IS 포함, IF 중복 포함) 네 가지 형식으로 쓰고, 각 분기의 정답을 다음 PC가
+아닌 **CPU 플래그로 조건을 평가해** 기록합니다. 테스트는 변환기 결과가 정답보다 많지 않고,
+커버 여부가 정확히 같으며, 부족분이 미판정 건수와 같은지 확인합니다.
+
+```bash
+cd tests/firmware
+./build.sh                                   # arm-none-eabi-gcc 필요
+python3 qemu_to_tarmac.py branchy_m4.elf m4 traces     # qemu-system-arm 필요
+python3 qemu_to_tarmac.py branchy_m35p.elf m35p traces
+```
 
 ## 진단 및 추가 옵션
 
@@ -762,6 +1044,7 @@ python3 -m unittest discover -s tests -v
 ```
 
 Python 3.6.8 및 3.12.14 인터프리터에서 아래 66개 테스트의 통과를 확인했습니다.
+branch coverage, inline 귀속, coverage 요약, line 0 배치, coverage 상세 테스트를 더한 111개는 Python 3.13에서 확인했습니다.
 `dataclasses` 등의 backport 패키지를 설치할 필요는 없습니다.
 
 - 제공된 두 로그 문법을 바탕으로 만든 fixture: 명령어 추출, EXC/메모리 제외,
@@ -787,6 +1070,15 @@ Python 3.6.8 및 3.12.14 인터프리터에서 아래 66개 테스트의 통과�
   재번호 부여, 큰 번호의 밀집 비트마스크, ELF/매핑/summary 오류 및 기존 출력 보존을 검증합니다.
   800개 개별 출력의 재merge total이 최초 배치 total과 바이트 단위로 일치함을 확인합니다.
 - 반복 해석 캐시가 CCFAIL·fetch 실패·IS/IF·malformed 및 실행 횟수를 보존하는지 검증합니다.
+- Branch coverage: 조건 분기 명령어 분류, GNU/LLVM objdump 결과 일치, IT 블록 처리,
+  다음 PC 판정 규칙(CCFAIL/IS, IF 중복, 예외, trace 끝, 간접 분기), Cortex-M4/M35P 실제 실행
+  trace 4종의 정답 비교, 출력 형식, `--no-branch`/`--executed-only`, 배치 total과
+  `--merge-list` 결과 일치, 혼합/변조 프로파일 거부, inline 코드의 함수 귀속(실제
+  Arm ELF, GNU/LLVM addr2line)을 검증합니다. Arm용 objdump/addr2line이
+  없으면 해당 테스트는 skip됩니다.
+- Line 0 배치: 흐름이 끊기는 명령어 판정, 규칙별 결과, inline 함수 경계, `??:0`, 이웃
+  명령어의 지연 해석, 실제 clang ELF(`tests/firmware/line0.c`)에서 inline 본문 안의
+  line 0이 본문 라인으로 가는지, 일반/`--executed-only` 출력이 같은지를 검증합니다.
 
 ELF 통합 테스트에는 `gcc`, `nm`, `addr2line`, `objdump`가 필요하며 없으면 해당 테스트가
 skip됩니다. 테스트는 호스트에서 컴파일한 ELF 주소에 합성 Tarmac 이벤트를 연결하는
