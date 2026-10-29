@@ -133,6 +133,8 @@ def main(argv=None):
             with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=str(destination.parent), delete=False) as out:
                 temporary = out.name
                 out.write(document)
+            # The temporary file is owner-only (0600); the page is shared.
+            os.chmod(temporary, 0o666)
             os.replace(temporary, str(destination))
             temporary = None
         finally:

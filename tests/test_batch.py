@@ -81,6 +81,10 @@ class BatchTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertIn("[12/12]", result.stderr)
             self.assertEqual((output / old_name).read_text(), "previous failed output")
+            # Every result the run wrote can be opened by other users (farm jobs).
+            for path in output.iterdir():
+                if path.name != old_name:
+                    self.assertEqual(path.stat().st_mode & 0o777, 0o666, path.name)
         for path in outputs[0].glob("*.out"):
             self.assertEqual(path.read_bytes(), (outputs[1] / path.name).read_bytes(), path.name)
         reports = [json.loads((output / "batch_report.json").read_text()) for output in outputs]

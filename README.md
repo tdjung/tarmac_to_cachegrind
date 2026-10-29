@@ -85,6 +85,10 @@ bash run_compute_farm.sh /work/tests \
 내부 `ud`/Compute Farm 설정을 따릅니다. 외부 환경의 검증에는 가짜 `ud`를 사용해
 인자·공백·종료 코드 전달을 확인했습니다. 실제 farm 접속은 내부망에서 확인해야 합니다.
 
+결과 파일(cachegrind, coverage, report, `bundle_html.py`의 HTML)은 farm 작업 계정과 상관없이 누구나 읽고 쓸 수
+있게 `-rw-rw-rw-`(0666)로 만듭니다. `-o` 폴더를 새로 만들 때 폴더 권한은 작업 환경의 umask를 따르므로,
+다른 사람이 들어갈 수 없다면 미리 만들어 두거나 `chmod`로 열어 주세요.
+
 ## 요구사항
 
 - Python 3.6.8 이상. `pip install` 불필요.
