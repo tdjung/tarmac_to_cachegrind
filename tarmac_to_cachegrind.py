@@ -345,9 +345,17 @@ def write_cachegrind(out: TextIO, costs: CounterType[Position], elf: Path) -> No
     out.write(f"summary: {sum(costs.values())}\n")
 
 
+# Outputs are shared: batch jobs run on a compute farm as one user and the
+# results are opened by others. The temporary file behind an atomic write is
+# created owner-only (0600), so set the mode explicitly before it replaces the output.
+OUTPUT_MODE = 0o666
+
+
 @contextmanager
 def atomic_text(path: Path):
-    """Do not leave a partial output file if conversion or writing fails."""
+    """Do not leave a partial output file if conversion or writing fails.
+
+    The finished file is readable and writable by everyone (OUTPUT_MODE)."""
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -356,6 +364,7 @@ def atomic_text(path: Path):
         ) as out:
             temporary = Path(out.name)
             yield out
+        os.chmod(str(temporary), OUTPUT_MODE)
         os.replace(temporary, path)
     finally:
         if temporary is not None:

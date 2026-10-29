@@ -193,6 +193,18 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(path.read_text(), "original")
             self.assertEqual(list(Path(directory).iterdir()), [path])
 
+    def test_atomic_writer_output_is_shared_whatever_the_umask(self):
+        # Compute-farm jobs write results that other users open.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "profile"
+            previous = os.umask(0o077)
+            try:
+                with converter.atomic_text(path) as out:
+                    out.write("events: Ir\n")
+            finally:
+                os.umask(previous)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o666)
+
     def test_addr2line_discriminator_unknowns_and_unique_batches(self):
         result = subprocess.CompletedProcess([], 0, "foo()\nC:/src/main.cpp:12 (discriminator 2)\n??\n??:?\n", "")
         with patch.object(converter.subprocess, "run", return_value=result) as run:

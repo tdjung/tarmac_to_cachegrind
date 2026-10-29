@@ -26,6 +26,7 @@ class GuideToolsTests(unittest.TestCase):
             url = 'https://internal.example/repo?a=1&b="two"'
             self.assertEqual(bundle.main([str(page), '-o', str(page), '--image', 'sample=' + str(image), '--link', 'docs=' + url]), 0)
             result = page.read_text()
+            self.assertEqual(page.stat().st_mode & 0o777, 0o666)
             self.assertIn('data:image/png;base64,' + base64.b64encode(data).decode(), result)
             self.assertIn('alt="src=example"', result)
             self.assertIn('&amp;b=&quot;two&quot;', result)
